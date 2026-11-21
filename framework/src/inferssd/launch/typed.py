@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import ntpath
 import posixpath
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Optional, cast
 
@@ -19,19 +20,28 @@ from inferssd.configuration.settings import (
     schema,
     uncomment,
 )
-from inferssd.launch.darwin import MODEL_OPTIONS
 from inferssd.launch.resources import EngineResources, server_binary
 from inferssd.launch.types import AwaitFact, Fact, LaunchInput, Reply, Resolution, State, Threads
-from inferssd.strategy.inputs import model_facts_from
+from inferssd.machine.identity import TIER_BACKENDS
+from inferssd.strategy.inputs import model_facts_from, runtime_facts_from
 from inferssd.strategy.launch import Planned, plan
+
+# The engine options that name a model: the launch names the model itself.
+MODEL_OPTIONS = frozenset(
+    ("-m", "--model", "-mu", "--model-url", "-dr", "--docker-repo")
+    + ("-hf", "-hfr", "--hf-repo", "-hff", "--hf-file")
+)
 
 # Each model profile's chat template: a bundled template replaces the GGUF's,
 # and None keeps the template in the GGUF. The expert count comes from the model.
+# A model with routed experts needs a profile, for the engine executes routed experts
+# by architecture; a model without them runs without one.
 PROFILES: dict[str, Optional[str]] = {
     "dsv": "deepseek-ai-DeepSeek-V4.1.jinja",
     "muse": "muse-spark.jinja",
     "qwen4exp": None,  # Qwen3.8-Flash-Next
     "qwen35moe": None,  # Qwen3.6-35B-A3B; its GGUF carries the model's sampling
+    "gemma4": None,  # Gemma 4
 }
 # The profile of each GGUF general.architecture; --profile overrides it.
 ARCHITECTURES = {
@@ -39,12 +49,15 @@ ARCHITECTURES = {
     "muse-spark": "muse",
     "qwen4exp": "qwen4exp",
     "qwen35moe": "qwen35moe",
+    "gemma4": "gemma4",
 }
 # The server's default sampling for each profile, from the model's own
 # generation config where the GGUF carries none; a request's values win.
 SAMPLING: dict[str, tuple[str, ...]] = {
     "dsv": ("--temp", "1.0", "--top-p", "0.95", "--top-k", "0", "--min-p", "0"),
 }
+# The address of this machine only, where the server listens by default.
+LOOPBACK = "127.0.0.1"
 
 
 @dataclass(frozen=True)
@@ -54,9 +67,8 @@ class LaunchSpec:
     settings_file: Optional[str] = None
     overrides: tuple[tuple[str, str], ...] = ()
     binary: Optional[str] = None
-    artifact_directory: Optional[str] = None
-    # Unset sizes take CONTEXT and BATCH, or one pass per prompt where the
-    # strategy prefills that way: -b and -ub as large as the context.
+    # Unset sizes take CONTEXT and BATCH; with the strategy, one pass per
+    # prompt: -b and -ub as large as the context.
     context: Optional[int] = None
     batch: Optional[int] = None
     ubatch: Optional[int] = None
@@ -69,9 +81,33 @@ class LaunchSpec:
     # The directory that keeps each model's prompt cache across restarts, in a
     # subdirectory named after the model; None runs without a prompt cache.
     prompt_cache: Optional[str] = None
+    # The IPv4 address the server listens on; see listen_host.
+    host: str = LOOPBACK
 
 
-CONTEXT = 8192
+def listen_host(text: str) -> str:
+    """TEXT as the IPv4 address the server listens on.
+
+    127.0.0.1 is this machine only and 0.0.0.0 every network interface. The
+    launch confirms its listener by address, so a host name is not accepted.
+    """
+    try:
+        return str(ipaddress.IPv4Address(text))
+    except ValueError:
+        raise ValueError("host must be an IPv4 address, such as 127.0.0.1 or 0.0.0.0") from None
+
+
+def connect_host(host: str) -> str:
+    """The address at which this machine reaches a server listening on HOST."""
+    return LOOPBACK if host == "0.0.0.0" else host
+
+
+# A context left unset: 0, which the engine resolves to the largest multiple of 8192 up to the
+# model's trained context whose KV cache fits memory when full (it holds memory only for the
+# cells in use).
+AUTO_CONTEXT = 0
+# One pass a prompt with the context unset: a batch the engine bounds by the context it chose.
+ONE_PASS_BATCH = 1 << 20
 BATCH = 512
 # The disk prompt cache's size limit per model.
 PROMPT_CACHE_MIB = 16384
@@ -159,6 +195,32 @@ def materialized_settings(value: Snapshot) -> str:
     )
 
 
+def cpu_defaults(raw: object, allowed: Sequence[int], given: Threads) -> Threads:
+    """Default CPU work to the available fast cluster; preserve explicit counts."""
+    if not isinstance(raw, Mapping) or type(raw.get("affinity_supported")) is not bool:
+        raise ValueError("invalid CPU topology")
+    clusters = raw.get("clusters")
+    if not isinstance(clusters, list) or not clusters:
+        raise ValueError("invalid CPU clusters")
+    fast: set[int] = set()
+    for cluster in clusters:
+        if not isinstance(cluster, Mapping) or not isinstance(cluster.get("cpus"), list):
+            raise ValueError("invalid CPU cluster")
+        ids = cluster["cpus"]
+        if any(type(cpu) is not int or cpu < 0 for cpu in ids):
+            raise ValueError("invalid CPU IDs")
+        if cluster.get("kind") == "performance":
+            fast.update(ids)
+    selected = sorted(set(allowed) & fast) or sorted(set(allowed))
+    if not selected:
+        raise ValueError("no available CPUs for inference")
+    count = min(256, len(selected))
+    decode, batch = given.decode or count, given.batch or count
+    if raw["affinity_supported"] and max(selected) < 512 and max(decode, batch) <= len(selected):
+        return Threads(decode, batch, tuple(selected))
+    return Threads(decode, batch)
+
+
 def _resolve(
     s: State,
     spec: LaunchSpec,
@@ -177,6 +239,7 @@ def _resolve(
     sizes = [size for size in (spec.context, spec.batch, spec.ubatch) if size is not None]
     if not 1 <= spec.port <= 65535 or any(size < 1 for size in sizes):
         raise ValueError("invalid port, context or batch size")
+    listen_host(spec.host)
     threads = threadpools(spec.threads, platform)
     protected = {
         "-m",
@@ -289,15 +352,6 @@ def _resolve(
     for path in paths:
         if not s.value("is_file", path):
             raise ValueError("missing GGUF shard: " + path)
-    profile = s.inputs.profile
-    if not profile:
-        architecture = model_facts_from(s.value("model_facts", *paths)).architecture
-        if architecture not in ARCHITECTURES:
-            raise ValueError(
-                f"no model profile for the GGUF architecture {architecture}; choose one with "
-                "--profile " + ", ".join(PROFILES)
-            )
-        profile = ARCHITECTURES[architecture]
     resources = spec.resources
     if resources is not None and resources.platform not in (None, platform):
         raise ValueError("engine resource platform differs from the selected platform")
@@ -309,14 +363,23 @@ def _resolve(
     binary = s.text("resolved_path", binary_path)
     if not s.value("is_file", binary) or not s.value("is_executable", binary):
         raise ValueError("missing server executable: " + binary)
+    # The engine's facts of the model, read once for the profile and the strategy.
+    facts = model_facts_from(s.value("model_facts", binary, model))
+    experts = facts.experts is not None
+    profile = s.inputs.profile or ARCHITECTURES.get(facts.architecture or "")
+    if not profile and experts:
+        raise ValueError(
+            f"no model profile for the GGUF architecture {facts.architecture}; choose one with "
+            "--profile " + ", ".join(PROFILES)
+        )
     # The engine's GPU backends: the descriptor's, else its build's; None when neither says.
     gpu_backends = resources.gpu_backends if resources is not None else None
     if gpu_backends is None:
         built = s.value("engine_gpu_backends", binary)
         gpu_backends = None if built is None else tuple(cast(list[str], built))
-    bundled = PROFILES[profile]
+    bundled = PROFILES[profile] if profile else None
     template_path = spec.template
-    if not template_path and bundled:
+    if not template_path and profile and bundled:
         template_path = resources.template(profile) if resources else None
         if not template_path and s.inputs.repo:
             template_path = os_path.join(s.inputs.repo, "engine", "models", "templates", bundled)
@@ -352,22 +415,70 @@ def _resolve(
     planned: Optional[Planned] = None
     if spec.strategy:
         # The strategy fills what the user left unset; the checks below see the result.
-        planned = plan(s, platform, memory, paths, value, spec.threads, gpu_backends)
+        planned = plan(
+            s,
+            platform,
+            memory,
+            paths,
+            lambda: facts,
+            value,
+            spec.threads,
+            gpu_backends,
+        )
         value, threads = planned.settings, threadpools(planned.threads, platform)
         if any(argument in protected for argument in planned.server_args[::2]):
             raise ValueError("the launch strategy names a protected server option")
-    if not value.at("expert.source").value:
+        # This newly supported CPU model has no measured thread/compute priors on
+        # many existing profiles. Avoid the unpriced all-core fallback on hybrid
+        # machines; priced strategies and explicit user thread choices still win.
+        costs = dict(cast(tuple[tuple[str, float], ...], value.at("place.costs").value))
+        if (
+            profile == "qwen4exp"
+            and gpu_backends == ()
+            and spec.threads == Threads()
+            and not {"cpu_fixed_us", "cpu_route_us"} <= costs.keys()
+            and value.at("cpu.decode_participants").value == 0
+        ):
+            runtime = runtime_facts_from(s.value("runtime_facts"))
+            io_cpus = set(cast(tuple[int, ...], value.at("cpu.io_cpus").value))
+            threads = threadpools(
+                cpu_defaults(
+                    s.value("cpu_topology"),
+                    [cpu for cpu in runtime.cpus if cpu not in io_cpus],
+                    spec.threads,
+                ),
+                platform,
+            )
+            chosen = dict(cast(Mapping[str, object], planned.receipt.get("chosen", {})))
+            actual = {
+                "decode": threads.decode,
+                "batch": threads.batch,
+                "cpus": list(threads.cpus),
+                "decode_cpus": list(threads.decode_cpus),
+            }
+            strategy_receipt = dict(
+                planned.receipt,
+                model_defaults={
+                    "reason": "qwen4exp CPU compute priors unavailable; use the live fast cluster",
+                    "previous_threads": chosen.get("threads", {}),
+                    "threads": actual,
+                },
+            )
+            chosen["threads"] = actual
+            strategy_receipt["chosen"] = chosen
+            planned = replace(planned, threads=threads, receipt=strategy_receipt)
+    if not experts and value.at("expert.source").value:
+        raise ValueError("expert.source names routed experts; the model has none")
+    if experts and not value.at("expert.source").value:
         if value.at("expert.source").origin != "default":
             raise ValueError("typed launch requires a nonempty explicit expert.source")
-        artifacts = spec.artifact_directory or os_path.join(directory, "artifacts")
-        s.ask("mkdir", artifacts)
-        alias = s.text("gguf_alias", artifacts, *paths)
+        # The engine indexes the routed experts from the model's own GGUF headers.
         selected = Setting(
             "expert.source",
-            (alias,),
+            tuple(paths),
             "file",
-            "strict GGUF header index",
-            " source=generated; input=complete GGUF shard/header validation",
+            "the model's GGUF files",
+            " source=model; input=its GGUF shards",
         )
         value = replace(
             value, entries=tuple(selected if x.key == selected.key else x for x in value.entries)
@@ -399,19 +510,25 @@ def _resolve(
                     "the memory controller is not delegated to your systemd user manager: "
                     "add Delegate=memory to a user@.service drop-in, or launch as root" + guide
                 )
-    # The CUDA tier finds its GPUs through nvidia-smi. With the engine's backends unknown, the
-    # engine itself refuses a budget it has no tier for.
-    if value.at("vram.budget").value != 0 and "CUDA" in (gpu_backends or ()):
+    # The launch reads the VRAM tier's GPUs through their driver: nvidia-smi for CUDA, amdkfd for
+    # ROCm. With the engine's backends unknown, the engine itself refuses a budget it has no tier
+    # for.
+    tier = set(TIER_BACKENDS) & set(gpu_backends or ())
+    if value.at("vram.budget").value != 0 and tier:
         if not s.value("gpu_available"):
-            raise ValueError("typed GPU execution requires nvidia-smi")
-    # A setting of a GPU backend's expert tier needs an engine built with that backend.
+            raise ValueError(
+                "typed GPU execution requires the GPUs' driver: "
+                "nvidia-smi for CUDA, amdkfd for ROCm"
+            )
+    # A setting of the expert tier needs an engine built with a backend that carries it.
     for item in value.entries:
         backend = schema()["properties"][item.key].get("backend")
         if backend and item.origin != "default" and gpu_backends is not None:
-            if backend not in gpu_backends:
+            if not set(backend.split(",")) & set(gpu_backends):
                 raise ValueError(
-                    f"{item.key} ({item.location}) configures the {backend} expert tier, "
-                    "which this engine was built without"
+                    f"{item.key} ({item.location}) configures the expert tier of "
+                    + " or ".join(backend.split(","))
+                    + ", which this engine was built without"
                 )
     # The sink's I/O thread keeps its own CPUs; decode runs on the first decode threads.
     if set(cast(tuple[int, ...], value.at("cpu.io_cpus").value)) & set(
@@ -427,9 +544,9 @@ def _resolve(
     if planned is not None:
         receipt = json.dumps(planned.receipt, ensure_ascii=False, indent=2) + "\n"
         s.ask("write_exclusive", os_path.join(directory, "strategy.json"), receipt)
-    context = spec.context or CONTEXT
+    context = spec.context or AUTO_CONTEXT
     one_pass = planned is not None and planned.one_pass
-    batch = spec.batch or (context if one_pass else BATCH)
+    batch = spec.batch or ((context or ONE_PASS_BATCH) if one_pass else BATCH)
     ubatch = spec.ubatch or (batch if one_pass else BATCH)
     if planned is not None and one_pass:
         given = [name for name, size in (("-b", spec.batch), ("-ub", spec.ubatch)) if size]
@@ -470,7 +587,7 @@ def _resolve(
         command += ["--chat-template-file", template]
     if profile == "dsv":
         command += ["--chat-template-kwargs", DSV_TEMPLATE_KWARGS]
-    sampling = SAMPLING.get(profile, ())
+    sampling = SAMPLING.get(profile or "", ())
     named = {x.split("=", 1)[0] for x in s.inputs.extra}
     for option, number in zip(sampling[::2], sampling[1::2]):
         if option not in named:
@@ -490,16 +607,18 @@ def _resolve(
         ]
     command += [
         "--host",
-        "127.0.0.1",
+        spec.host,
         "--port",
         str(spec.port),
         "-np",
         "1",
-        # The SSD executor reads the routed experts; their mapped pages stay unread.
-        "--defer-experts",
     ]
+    if experts:
+        # The SSD executor reads the routed experts; their mapped pages stay unread.
+        command += ["--defer-experts"]
+    # Flash Attention stays the server's auto choice on every platform: on for each layer whose
+    # device runs it, which is every layer wherever the backends implement it.
     if platform == "linux":
-        command += ["-fa", "on"]
         s.scope = (
             ["systemd-run"]
             + (["--user"] if uid != 0 else [])

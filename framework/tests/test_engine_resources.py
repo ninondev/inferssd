@@ -2,17 +2,27 @@
 
 from __future__ import annotations
 
-import resource
+import os
+import socket
+import sys
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from test_engine_runtime import policy
 
+from inferssd.engine import owned
 from inferssd.launch.live import Command, LiveArtifacts, NativeHost
 from inferssd.launch.resources import cmake_gpu_backends
 from inferssd.launch.types import Fact, LaunchInput
 from inferssd.platform import resources
+
+if sys.platform != "win32":
+    import resource
+
+posix = pytest.mark.skipif(
+    sys.platform == "win32", reason="POSIX resource envelopes: cgroup v2, rlimits, Darwin counters"
+)
 
 
 def linux_files(monkeypatch, budget):
@@ -38,6 +48,7 @@ def linux_files(monkeypatch, budget):
     return files
 
 
+@posix
 def test_linux_actual_budget_memlock_and_oom(tmp_path, monkeypatch):
     p = replace(policy(tmp_path, "linux"), minimum_memlock_bytes=4096)
     files = linux_files(monkeypatch, p.memory_budget_bytes)
@@ -50,6 +61,7 @@ def test_linux_actual_budget_memlock_and_oom(tmp_path, monkeypatch):
         runtime.sample(123)
 
 
+@posix
 @pytest.mark.parametrize(
     "file,value,error",
     [
@@ -71,11 +83,12 @@ def test_linux_negative_envelope(tmp_path, monkeypatch, file, value, error):
         runtime.sample(123)
 
 
+@posix
 @pytest.mark.parametrize(
-    "soft,minimum,accepted",
-    [(0, 4096, False), (4096, 4096, True), (resource.RLIM_INFINITY, 1 << 40, True)],
+    "soft,minimum,accepted", [(0, 4096, False), (4096, 4096, True), (None, 1 << 40, True)]
 )
 def test_memlock_finite_unlimited_insufficient(tmp_path, monkeypatch, soft, minimum, accepted):
+    soft = resource.RLIM_INFINITY if soft is None else soft
     p = replace(policy(tmp_path, "linux"), minimum_memlock_bytes=minimum)
     linux_files(monkeypatch, p.memory_budget_bytes)
     monkeypatch.setattr(resources.resource, "getrlimit", lambda _: (soft, resource.RLIM_INFINITY))
@@ -87,6 +100,7 @@ def test_memlock_finite_unlimited_insufficient(tmp_path, monkeypatch, soft, mini
             runtime.prepare()
 
 
+@posix
 def test_darwin_explicit_soft_budget_and_growth(tmp_path, monkeypatch):
     p = replace(policy(tmp_path), memory_budget_bytes=1 << 20, host_reserve_bytes=0)
     replies = {
@@ -121,9 +135,45 @@ def test_exact_listener_pid_is_required(tmp_path, monkeypatch):
     runtime = resources.Resources(policy(tmp_path))
     monkeypatch.setattr(resources, "command", lambda _: "p999\0n127.0.0.1:8080\0")
     with pytest.raises(RuntimeError, match="exact server PID"):
-        runtime.confirm_listener(123, 8080)
+        runtime.confirm_listener(123, "127.0.0.1", 8080)
     monkeypatch.setattr(resources, "command", lambda _: "p123\0n127.0.0.1:8080\0")
-    runtime.confirm_listener(123, 8080)
+    runtime.confirm_listener(123, "127.0.0.1", 8080)
+
+
+@pytest.mark.parametrize("host,name", [("0.0.0.0", "*:8080"), ("127.0.0.2", "127.0.0.2:8080")])
+def test_listener_is_confirmed_at_the_address_the_server_binds(tmp_path, monkeypatch, host, name):
+    runtime = resources.Resources(policy(tmp_path))
+    # lsof -F0pn output, with the file descriptor field it also prints.
+    monkeypatch.setattr(resources, "command", lambda _: f"p123\0\nf3\0n{name}\0")
+    runtime.confirm_listener(123, host, 8080)
+    with pytest.raises(RuntimeError, match="exact server PID"):
+        runtime.confirm_listener(123, "127.0.0.1", 8080)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="reads this process's /proc/net/tcp")
+@pytest.mark.parametrize("host", ["127.0.0.1", "0.0.0.0"])
+def test_linux_listener_is_found_in_proc_net_tcp(tmp_path, host):
+    runtime = resources.Resources(policy(tmp_path, "linux"))
+    with socket.socket() as listener:
+        listener.bind((host, 0))
+        listener.listen()
+        port = listener.getsockname()[1]
+        runtime.confirm_listener(os.getpid(), host, port)
+        other = "0.0.0.0" if host == "127.0.0.1" else "127.0.0.1"
+        with pytest.raises(RuntimeError, match="exact server PID"):
+            runtime.confirm_listener(os.getpid(), other, port)
+
+
+@pytest.mark.parametrize(
+    "argv,host",
+    [
+        (["server", "--port", "8080"], "127.0.0.1"),
+        (["server", "--host", "0.0.0.0", "--port", "8080"], "0.0.0.0"),
+        (["server", "--host", "127.0.0.1", "--host", "127.0.0.2"], "127.0.0.2"),
+    ],
+)
+def test_owner_takes_the_listening_host_from_the_server_argv(argv, host):
+    assert owned.listening_host(argv) == host
 
 
 class Host:
@@ -137,10 +187,6 @@ class Host:
     def which(self, name):
         self.events.append(("which", name))
         return True
-
-    def contains(self, path, needle):
-        self.events.append(("contains", path))
-        return path == "first"
 
     def exists(self, path):
         self.events.append(("exists", path))
@@ -175,18 +221,13 @@ class Host:
         return 1024
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="the Linux launcher's facts: /proc, nproc, stat -f"
+)
 def test_host_is_lazy_and_short_circuits_original_facts():
     host = Host()
-    adapter = LiveArtifacts(
-        LaunchInput("/fixture/repo", ()),
-        host=host,
-        run=lambda _: pytest.fail("unexpected indexer"),
-        replace=lambda *_: None,
-        python="fixture-python",
-    )
+    adapter = LiveArtifacts(LaunchInput("/fixture/repo", ()), host=host)
     assert host.events == []
-    assert adapter(Fact("has_uring", ("first", "never"))).value is True
-    assert host.events == [("contains", "first")]
     assert adapter(Fact("memory_kib")).value == (4000, 2000)
     host.replies["nproc"] = Command(0, "8\n")
     assert adapter(Fact("default_threads")).value == "8"
@@ -198,13 +239,7 @@ def test_host_is_lazy_and_short_circuits_original_facts():
 def test_gpu_failed_or_na_and_checked_command_error():
     host = Host()
     host.replies["nvidia-smi"] = Command(1, "invalid")
-    adapter = LiveArtifacts(
-        LaunchInput("/fixture", ()),
-        host=host,
-        run=lambda _: None,
-        replace=lambda *_: None,
-        python="fixture",
-    )
+    adapter = LiveArtifacts(LaunchInput("/fixture", ()), host=host)
     assert adapter(Fact("gpu_memory")).value == ""
     host.replies["nvidia-smi"] = Command(0, "N/A\n999\n")
     assert adapter(Fact("gpu_memory")).value == "N/A"
@@ -216,8 +251,11 @@ def test_gpu_failed_or_na_and_checked_command_error():
 def test_a_builds_gpu_backends_are_read_from_its_cmake_cache():
     cache = "GGML_CUDA:BOOL=ON\nGGML_METAL:BOOL=OFF\n// comment\nGGML_VULKAN:BOOL=TRUE\n"
     assert cmake_gpu_backends(cache) == ("CUDA", "Vulkan")
-    metal = "GGML_METAL:BOOL=ON\nGGML_CUDA_KIMI_VRAM_TIER:BOOL=ON\n"
+    metal = "GGML_METAL:BOOL=ON\nGGML_CUDA_SSD_VRAM_TIER:BOOL=ON\n"
     assert cmake_gpu_backends(metal) == ("Metal",)
+    # ggml's HIP backend runs AMD GPUs on ROCm, with the tier built from the CUDA sources.
+    hip = "GGML_HIP:BOOL=ON\nGGML_CUDA:BOOL=OFF\nGGML_CUDA_SSD_VRAM_TIER:BOOL=ON\n"
+    assert cmake_gpu_backends(hip) == ("ROCm",)
     assert cmake_gpu_backends("") == ()
 
 
@@ -225,13 +263,7 @@ def test_the_engine_gpu_backends_fact_reads_the_servers_build(tmp_path):
     build = tmp_path / "build-linux-cuda"
     (build / "bin").mkdir(parents=True)
     binary = str(build / "bin" / "inferssd-server")
-    adapter = LiveArtifacts(
-        LaunchInput(str(tmp_path), ()),
-        host=NativeHost(),
-        run=lambda _: pytest.fail("unexpected indexer"),
-        replace=lambda *_: None,
-        python="fixture-python",
-    )
+    adapter = LiveArtifacts(LaunchInput(str(tmp_path), ()), host=NativeHost())
     # A server outside a CMake build: its backends are unknown.
     assert adapter(Fact("engine_gpu_backends", (binary,))).value is None
     # A UTF-8 cache, whatever this host's locale: it names the build's paths.

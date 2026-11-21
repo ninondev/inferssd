@@ -1,0 +1,70 @@
+name: Package macOS
+
+# Build the prebuilt Apple silicon package and check it on the oldest and the newest macOS it runs
+# on. Only Release builds it, for each release, which publishes it (release.yml), and a run by hand,
+# on any branch, which builds and checks. See docs/macos-package.md.
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        description: Exact commit to build and check for the release
+        required: true
+        type: string
+      release_tag:
+        description: The release's tag, its version <yymmdd>.<build>, which the package is checked against
+        required: true
+        type: string
+  # By hand, on any branch: build and check. Only Release publishes. Pull requests and merges do not
+  # build the package.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A branch's runs queue in its group, and a release's run in its own.
+  group: package-macos-${{ inputs.release_tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.source_ref }}
+          # The build number is the commit count of main.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Build the package
+        env:
+          INFERSSD_RELEASE_TAG: ${{ inputs.release_tag }}
+        run: scripts/package-macos.sh dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-macos
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  check:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-26]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: package-macos
+          path: dist
+      - name: Install and run the package without developer tools
+        run: scripts/check-package-macos.sh dist/inferssd-*-macos-arm64.tar.gz
+

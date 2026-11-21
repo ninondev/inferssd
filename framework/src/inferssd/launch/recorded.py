@@ -1,144 +1,27 @@
-"""Local artifact preparation plus required recorded host facts; never starts an engine."""
+"""Local file facts plus required recorded host facts; never starts an engine."""
 
 from __future__ import annotations
 
-import glob
-import hashlib
-import io
-import json
 import os
-import shlex
-import subprocess
-import sys
-import tempfile
-import traceback
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Optional
 
-from inferssd.launch.darwin import PROFILES
 from inferssd.launch.resources import GPU_BACKENDS
 from inferssd.launch.types import Fact, LaunchInput, Reply
 from inferssd.machine import characteristics
-from inferssd.source import experts
 from inferssd.strategy import inputs as strategy_inputs
-
-
-def metadata(name: str, arguments: tuple[str, ...]) -> Reply:
-    """Keep the subprocess-style reply boundary using the typed artifact functions.
-
-    Tracebacks identify the actual Python source. They are not rewritten to look
-    like the former shell's helper process. SystemExit and partial writes remain.
-    """
-    stdout, stderr = io.StringIO(), io.StringIO()
-
-    def emit(*values: object, **keywords: Any) -> None:
-        stream = stderr if keywords.pop("file", None) is sys.stderr else stdout
-        print(*values, file=stream, **keywords)
-
-    try:
-        if name == "index":
-            experts.index(arguments[0], None, arguments[1], emit=emit)
-        elif name == "source_facts":
-            experts.facts(arguments[0], arguments[1] or None, emit=emit)
-        elif name == "dense":
-            experts.dense(*arguments, emit=emit)
-        else:
-            raise ValueError("Unknown artifact operation: " + name)
-    except SystemExit as error:
-        if isinstance(error.code, int):
-            code = error.code
-        elif error.code is None:
-            code = 0
-        else:
-            stderr.write(str(error.code) + "\n")
-            code = 1
-        return Reply(None, stdout.getvalue(), stderr.getvalue(), code)
-    except Exception:
-        stderr.write(traceback.format_exc())
-        return Reply(None, stdout.getvalue(), stderr.getvalue(), 1)
-    values = (
-        dict(word.split("=", 1) for word in shlex.split(stdout.getvalue()))
-        if name != "index"
-        else {}
-    )
-    return Reply(values, stdout.getvalue(), stderr.getvalue())
-
-
-def generate_alias(
-    paths: tuple[str, ...],
-    profile: Optional[str],
-    cache_dir: Path,
-    *,
-    repo: str,
-    python: str,
-    run: Callable[[list[str]], None],
-    replace: Callable[[str, str], None],
-) -> str:
-    """Run the strict GGUF alias indexer, then publish the index and its summary in order.
-
-    The historical launcher's profile also fixes the expert count it checks; without one
-    the indexer reads it from the model.
-    """
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    name = hashlib.sha256(((profile or "") + "\0" + paths[0]).encode()).hexdigest()[:20]
-    alias, summary = cache_dir / f"{name}.tsv", cache_dir / f"{name}.json"
-    with tempfile.TemporaryDirectory(prefix=".index-", dir=cache_dir) as temporary:
-        pending_alias, pending_summary = (
-            Path(temporary) / "index.tsv",
-            Path(temporary) / "summary.json",
-        )
-        command = [
-            python,
-            "-I",
-            "-m",
-            "inferssd.source.gguf_alias",
-            "--out",
-            str(pending_alias),
-            "--summary-json",
-            str(pending_summary),
-        ]
-        if profile:
-            command[4:4] = ["--n-experts", str(PROFILES[profile][0])]
-        if repo:
-            command[4:4] = ["--repo", repo]
-        for path in paths:
-            command.extend(("--model-glob", glob.escape(path)))
-        run(command)
-        data = json.loads(pending_summary.read_text())
-        if data.get("model_shards") != len(paths) or data.get("entries", 0) <= 0:
-            raise ValueError("GGUF metadata did not produce a complete nonempty expert index")
-        data["output_tsv"] = str(alias)
-        pending_summary.write_text(json.dumps(data, indent=2) + "\n")
-        replace(str(pending_alias), str(alias))
-        replace(str(pending_summary), str(summary))
-    return str(alias)
-
-
-def run_indexer(command: list[str]) -> None:
-    # The only subprocess allowed by this adapter is the installed strict header
-    # indexer, assembled by generate_alias. Engine argv never reaches this call.
-    subprocess.run(command, check=True)
 
 
 class RecordedArtifacts:
     """Filesystem effects are local; host observations must be supplied explicitly.
 
     A missing host field fails only when requested. This object does not call
-    nvidia-smi, sysctl, systemd, sockets, /proc or a server executable.
+    nvidia-smi, sysctl, systemd, sockets, /proc or a server executable, so the
+    model's facts (the engine's) are recorded too.
     """
 
-    def __init__(
-        self,
-        inputs: LaunchInput,
-        host: Mapping[str, object],
-        *,
-        run: Callable[[list[str]], None],
-        replace: Callable[[str, str], None],
-        python: str,
-    ):
+    def __init__(self, inputs: LaunchInput, host: Mapping[str, object]):
         self.inputs, self.host = inputs, host
-        self.run, self.replace, self.python = run, replace, python
 
     def __call__(self, fact: Fact) -> Reply:
         name, args = fact.name, fact.arguments
@@ -149,52 +32,24 @@ class RecordedArtifacts:
         if name == "read_text":
             with open(args[0], encoding="utf-8", newline="") as stream:
                 return Reply(stream.read())
-        if name == "model_matches":
-            directory, pattern = args
-            paths = [
-                path
-                for level in ("", "*/", "*/*/")
-                for path in sorted(glob.glob(directory + "/" + level + pattern))
-            ]
-            return Reply(tuple(paths))
-        if name == "absolute_directory":
-            return Reply(str(Path(args[0]).resolve(strict=True)))
         if name == "resolved_path":
             path = args[0]
             if path == "~" or path.startswith("~/"):
                 path = dict(self.inputs.environment).get("HOME", str(Path.home())) + path[1:]
             return Reply(str(Path(path).expanduser().resolve()))
-        if name == "older":
-            return Reply(os.stat(args[0]).st_mtime < os.stat(args[1]).st_mtime)
-        if name == "mkdir":
-            Path(args[0]).mkdir(parents=True, exist_ok=True)
-            return Reply()
         if name == "write_exclusive":
             with Path(args[0]).open("x", encoding="utf-8", newline="\n") as stream:
                 stream.write(args[1])
             return Reply()
-        if name in ("index", "source_facts", "dense"):
-            return metadata(name, args)
-        if name in ("mac_alias", "gguf_alias"):
-            # The historical Mac launcher names its profile first; the typed launch does not.
-            historical = name == "mac_alias"
-            profile = args[0] if historical else None
-            directory, *paths = args[1:] if historical else args
-            return Reply(
-                generate_alias(
-                    tuple(paths),
-                    profile,
-                    Path(directory),
-                    repo=self.inputs.repo,
-                    python=self.python,
-                    run=self.run,
-                    replace=self.replace,
+        if name == "cpu_topology" and name not in self.host:
+            saved = self.host.get("machine_characteristics")
+            if saved is not None:
+                data = (
+                    characteristics.loads(saved)
+                    if isinstance(saved, str)
+                    else characteristics.validate(saved)
                 )
-            )
-        if name == "model_facts" and name not in self.host:
-            # Read from the model's own headers, as the alias index is.
-            header = strategy_inputs.shard_facts(args)
-            return Reply(strategy_inputs.model_facts_json(header))
+                return Reply(data["cpu"])
         if (
             name in ("machine_characteristics", "model_drive_key", "engine_gpu_backends")
             and name not in self.host
@@ -207,10 +62,11 @@ class RecordedArtifacts:
         if name not in self.host:
             raise ValueError(f"Missing recorded host fact: {name}")
         value = self.host[name]
+        if name == "cpu_topology":
+            return Reply(value)  # The shared RAM thread selector validates this topology.
         boolean = {
             "gpu_available",
             "ss_available",
-            "has_uring",
             "systemd",
             "cgroup_v2",
             "user_manager",

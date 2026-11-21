@@ -28,7 +28,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+                 uint32_t   attn_n_grow) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -45,7 +46,9 @@ llama_memory_hybrid::llama_memory_hybrid(
         filter_attn == nullptr ?
             [&](int32_t il) { return !hparams.is_recurrent(il); }
             : filter_attn,
-        nullptr
+        nullptr,
+        "",
+        attn_n_grow
     )),
     mem_recr(new llama_memory_recurrent(
         model,
@@ -237,6 +240,24 @@ bool llama_memory_hybrid_context::next() {
     }
 
     return true;
+}
+
+// apply() publishes the attention and the recurrent cache together, so the undo covers both
+bool llama_memory_hybrid_context::save_precompute() {
+    const bool attn = ctx_attn->save_precompute();
+    const bool recr = ctx_recr->save_precompute();
+    return attn && recr;
+}
+
+bool llama_memory_hybrid_context::restore_precompute() noexcept {
+    const bool recr = ctx_recr->restore_precompute();
+    const bool attn = ctx_attn->restore_precompute();
+    return attn && recr;
+}
+
+void llama_memory_hybrid_context::discard_precompute() noexcept {
+    ctx_attn->discard_precompute();
+    ctx_recr->discard_precompute();
 }
 
 bool llama_memory_hybrid_context::apply() {

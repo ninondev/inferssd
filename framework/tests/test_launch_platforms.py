@@ -39,10 +39,6 @@ def render(case):
             return Reply(case["settings"])
         if name == "mkdir":
             return Reply()
-        if name == "gguf_alias":
-            assert list(arguments[1:]) == case["shards"]
-            files.add(case["alias"])
-            return Reply(case["alias"])
         if name == "write_exclusive":
             written[arguments[0]] = arguments[1]
             return Reply()
@@ -93,7 +89,7 @@ def test_windows_qwen4exp_command_uses_the_model_template_and_settings_envelope(
     # No scope: host.budget_mib reaches the server through its settings file, as given.
     assert expected["scope"] == [] and not any(word.startswith("--ssd-host") for word in argv)
     settings = expected["settings"]["C:\\inferssd\\runs\\qwen4exp\\settings.ssd"]
-    assert "host.budget_mib = 14336" in settings and json.dumps([case["alias"]]) in settings
+    assert "host.budget_mib = 14336" in settings and json.dumps(case["shards"]) in settings
 
 
 def test_windows_passes_cli_settings_and_pins_threads():
@@ -107,7 +103,7 @@ def test_windows_passes_cli_settings_and_pins_threads():
 def test_linux_qwen4exp_keeps_the_linux_launch():
     expected = golden("linux-qwen4exp")
     assert "--chat-template-file" not in expected["argv"]
-    assert expected["argv"][-2:] == ["-fa", "on"] and "MemoryMax=17179869184" in expected["scope"]
+    assert "-fa" not in expected["argv"] and "MemoryMax=17179869184" in expected["scope"]
 
 
 @pytest.mark.parametrize(
@@ -123,10 +119,13 @@ def test_platform_options_default_to_this_host(monkeypatch, host, expected):
     assert parser.parse_args(words).platform == expected
 
 
-def test_windows_owned_execution_is_refused_before_any_effect(tmp_path, monkeypatch, capsys):
+def test_windows_owned_execution_reaches_the_owned_runtime(tmp_path, monkeypatch):
+    from inferssd.engine import command as engine
+
     monkeypatch.chdir(tmp_path)
+    calls = []
+    monkeypatch.setattr(engine, "run_native", lambda args, _: calls.append(args.platform) or 0)
     command = ["--execute", "--platform", "windows", "--model", "model.gguf"]
-    with pytest.raises(SystemExit) as error:
-        typed_command.main(command + ["--runtime-policy", "policy.json"])
-    assert error.value.code == 2 and "--dry-run" in capsys.readouterr().err
-    assert not list(tmp_path.iterdir())
+    command += ["--runtime-policy", "policy.json", "--output-dir", "run"]
+    assert typed_command.main(command) == 0
+    assert calls == ["windows"] and not list(tmp_path.iterdir())

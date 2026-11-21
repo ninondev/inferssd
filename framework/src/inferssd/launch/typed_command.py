@@ -20,9 +20,16 @@ from typing import Optional
 
 from inferssd.configuration.settings import PLATFORMS, cpus, host_platform
 from inferssd.launch.prepare import prepare
-from inferssd.launch.recorded import RecordedArtifacts, run_indexer
-from inferssd.launch.resources import read_resources
-from inferssd.launch.typed import BATCH, CONTEXT, PROFILES, LaunchSpec, resolve_typed
+from inferssd.launch.recorded import RecordedArtifacts
+from inferssd.launch.resources import cache_directory, read_resources
+from inferssd.launch.typed import (
+    BATCH,
+    LOOPBACK,
+    PROFILES,
+    LaunchSpec,
+    listen_host,
+    resolve_typed,
+)
 from inferssd.launch.types import LaunchInput, Output, Threads
 from inferssd.machine.characteristics import dumps, load
 from inferssd.platform.policy import Policy
@@ -62,25 +69,33 @@ def add_arguments(launch: argparse.ArgumentParser) -> None:
         "--set", dest="overrides", action="append", default=[], help="typed key=literal override"
     )
     launch.add_argument("--binary", type=Path)
-    launch.add_argument("--artifact-dir", type=Path)
     launch.add_argument(
         "--profile",
         choices=tuple(PROFILES),
         help="model profile (default: the one for the GGUF's general.architecture)",
     )
+    launch.add_argument(
+        "--host",
+        default=LOOPBACK,
+        help="IPv4 address the server listens on: 127.0.0.1 (default) is this machine only, "
+        "0.0.0.0 every network interface",
+    )
     launch.add_argument("--port", type=int, default=8080)
-    launch.add_argument("--context", type=int, help=f"-c (default: {CONTEXT})")
+    launch.add_argument(
+        "--context",
+        type=int,
+        help="-c (default: the largest multiple of 8192, up to the model's trained context, "
+        "that memory holds when full)",
+    )
     launch.add_argument(
         "--batch",
         type=int,
-        help=f"-b (default: the context where the strategy prefills a prompt in one pass, "
-        f"else {BATCH})",
+        help=f"-b (default: the context with the launch strategy, else {BATCH})",
     )
     launch.add_argument(
         "--ubatch",
         type=int,
-        help=f"-ub (default: --batch where the strategy prefills a prompt in one pass, "
-        f"else {BATCH})",
+        help=f"-ub (default: --batch with the launch strategy, else {BATCH})",
     )
     launch.add_argument(
         "--threads", type=int, help="decode ggml threads, -t (1..256; default: the server's)"
@@ -118,13 +133,7 @@ def add_arguments(launch: argparse.ArgumentParser) -> None:
 
 def prompt_cache_directory() -> Path:
     """This user's cache directory for inferssd prompt caches."""
-    if sys.platform == "darwin":
-        root = Path.home() / "Library" / "Caches"
-    elif sys.platform == "win32":
-        root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
-    else:
-        root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
-    return root / "inferssd" / "prompts"
+    return cache_directory() / "prompts"
 
 
 def specification(args: argparse.Namespace, *, strategy: bool = False) -> LaunchSpec:
@@ -140,7 +149,6 @@ def specification(args: argparse.Namespace, *, strategy: bool = False) -> Launch
         str(args.settings.resolve()) if args.settings else None,
         tuple(overrides),
         str(args.binary.resolve()) if args.binary else None,
-        str(args.artifact_dir.resolve()) if args.artifact_dir else None,
         args.context,
         args.batch,
         args.ubatch,
@@ -151,6 +159,7 @@ def specification(args: argparse.Namespace, *, strategy: bool = False) -> Launch
         None
         if args.prompt_cache == "off"
         else str(Path(args.prompt_cache or prompt_cache_directory()).resolve()),
+        listen_host(args.host),
     )
 
 
@@ -171,11 +180,6 @@ def default_output_directory() -> Path:
 
 
 def run(args: argparse.Namespace) -> int:
-    if args.execute and args.platform == "windows":
-        # The owned process, its lock lease and its resource sampling are POSIX.
-        raise ValueError(
-            "owned execution supports linux and darwin; prepare a windows launch with --dry-run"
-        )
     if args.machine is not None and args.reprofile:
         raise ValueError("--machine is used as it is; --reprofile measures this machine instead")
     if args.dry_run and args.reprofile:
@@ -204,9 +208,7 @@ def run(args: argparse.Namespace) -> int:
     if policy.platform != args.platform:
         raise ValueError("launch platform differs from policy")
     claim = reserve(str(args.output_dir))
-    adapter = RecordedArtifacts(
-        launch_input, host, run=run_indexer, replace=os.replace, python=sys.executable
-    )
+    adapter = RecordedArtifacts(launch_input, host)
 
     def emit(event: Output) -> None:
         (sys.stdout if event.channel == "stdout" else sys.stderr).write(event.text)

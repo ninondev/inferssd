@@ -1133,6 +1133,65 @@ void server_turn_memory_record(const common_chat_msg & msg) {
     memory.turns[key] = std::move(turn);
 }
 
+// Where an effort stands among the ones clients name, least first: OpenAI's and Codex's minimal to xhigh, and max,
+// which Anthropic's and Codex's go up to. Codex's ultra and persistent ask for more than max. -1 for any other word.
+static int reasoning_effort_rank(const std::string & effort) {
+    static const std::vector<std::string> ladder = {"minimal", "low", "medium", "high", "xhigh", "max"};
+    const auto it = std::find(ladder.begin(), ladder.end(), effort);
+    if (it != ladder.end()) {
+        return (int) (it - ladder.begin());
+    }
+    return effort == "ultra" || effort == "persistent" ? (int) ladder.size() : -1;
+}
+
+// How a request runs: thinking or not, and the reasoning_effort the template gets (empty: none, its own default).
+struct reasoning_choice {
+    bool        think = false;
+    std::string effort;
+};
+
+// Fits a request's reasoning_effort to what the chat template offers, as /props reports it, so that each client's
+// own words run as the nearest the model has instead of being refused. A value the template takes is used as it is.
+// "none" turns thinking off, or, where the template cannot, takes its least effort. An effort on the ladder above
+// takes the template's highest that does not exceed it, or its least if all of them do; a template with no such
+// efforts (one that only turns thinking on and off) thinks as it does by default, as do "on" and any other word.
+// A model that does not think runs without thinking whatever is asked.
+static reasoning_choice resolve_reasoning_effort(const std::optional<common_chat_reasoning> & reasoning,
+                                                 const std::string & effort) {
+    if (!reasoning) {
+        return {false, ""};
+    }
+    const auto & offered = reasoning->efforts;
+    if (std::find(offered.begin(), offered.end(), effort) != offered.end()) {
+        return {true, effort};
+    }
+    std::vector<std::pair<int, std::string>> ladder; // the template's efforts on the ladder, least first
+    for (const auto & value : offered) {
+        const int rank = reasoning_effort_rank(value);
+        if (rank >= 0) {
+            ladder.emplace_back(rank, value);
+        }
+    }
+    std::sort(ladder.begin(), ladder.end());
+    if (effort == "none") {
+        if (reasoning->can_turn_off) {
+            return {false, ""};
+        }
+        return {true, ladder.empty() ? std::string() : ladder.front().second};
+    }
+    const int rank = reasoning_effort_rank(effort);
+    if (rank < 0 || ladder.empty()) {
+        return {true, ""};
+    }
+    std::string chosen = ladder.front().second;
+    for (const auto & [value_rank, value] : ladder) {
+        if (value_rank <= rank) {
+            chosen = value;
+        }
+    }
+    return {true, chosen};
+}
+
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
@@ -1288,17 +1347,28 @@ json oaicompat_chat_params_parse(
         inputs.chat_template_kwargs[item.key()] = item.value().dump();
     }
 
-    // reasoning_effort (the OpenAI chat-completions field): "none" turns thinking off for this request, any other
-    // effort turns it on and goes to the template as reasoning_effort, which interprets it (DeepSeek-V4.1 maps it to
-    // its 1-100 scale). Template kwargs given in the request take precedence.
+    // reasoning_effort (the OpenAI chat-completions field) switches thinking per request: it is fitted to what the
+    // template offers (resolve_reasoning_effort), so that OpenAI's, Codex's and Anthropic's efforts all run on any
+    // model, and "on" thinks as the template does with no reasoning_effort. Template kwargs given in the request take
+    // precedence.
     if (body.contains("reasoning_effort") && !body.at("reasoning_effort").is_null()) {
         const json & effort = body.at("reasoning_effort");
-        const bool   off    = effort.is_string() && effort.get<std::string>() == "none";
-        if (!chat_template_kwargs_object.contains("enable_thinking")) {
-            inputs.chat_template_kwargs["enable_thinking"] = off ? "false" : "true";
+        if (!effort.is_string()) {
+            throw std::invalid_argument("\"reasoning_effort\" must be a string");
         }
-        if (!off && !chat_template_kwargs_object.contains("reasoning_effort")) {
-            inputs.chat_template_kwargs["reasoning_effort"] = effort.dump();
+        const std::string      asked  = effort.get<std::string>();
+        const reasoning_choice choice = resolve_reasoning_effort(opt.reasoning, asked);
+        const std::string used = !choice.think         ? std::string("thinking off") :
+                                 choice.effort.empty() ? std::string("the template's default") :
+                                                         "\"" + choice.effort + "\"";
+        if (choice.effort != asked && asked != "on" && !(asked == "none" && !choice.think)) {
+            SRV_INF("reasoning_effort \"%s\" runs as %s\n", asked.c_str(), used.c_str());
+        }
+        if (!chat_template_kwargs_object.contains("enable_thinking")) {
+            inputs.chat_template_kwargs["enable_thinking"] = choice.think ? "true" : "false";
+        }
+        if (!choice.effort.empty() && !chat_template_kwargs_object.contains("reasoning_effort")) {
+            inputs.chat_template_kwargs["reasoning_effort"] = json(choice.effort).dump();
         }
     }
 
@@ -1548,7 +1618,12 @@ json format_response_rerank(
 // other utils
 //
 
-std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx) {
+// Summed in descending order the softmax's total reaches 1 at its first term, the largest; a term under half an ulp of
+// the total then changes nothing, nor does any after it. Below max - 17.5 a term is expf() of less than -17.5, under
+// 2.6e-8, while half an ulp of 1 is 2^-24, about 6e-8: the total needs only the logits at or above that, sorted, and
+// the top n. Tokens of equal logit may come in another order than a sort of all of them gives.
+std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t n, llama_token token,
+                                                      float & token_p) {
     std::vector<llama_token_data> cur;
 
     const auto * logits = llama_get_logits_ith(ctx, idx);
@@ -1567,23 +1642,42 @@ std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int i
         }
     }
 
-    // sort tokens by logits
-    std::sort(cur.begin(), cur.end(), [](const llama_token_data & a, const llama_token_data & b) {
-        return a.logit > b.logit;
-    });
+    if (cur.empty()) {
+        return cur;
+    }
+    const auto by_logit = [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; };
+    float max_l = cur[0].logit;
+    for (const auto & t : cur) {
+        max_l = std::max(max_l, t.logit);
+    }
+    const float floor_l = max_l - 17.5f;
+    auto head = std::partition(cur.begin(), cur.end(), [&](const llama_token_data & t) { return t.logit >= floor_l; });
+    if (size_t(head - cur.begin()) < n) {
+        head = cur.begin() + std::min(n, cur.size());
+        std::partial_sort(cur.begin(), head, cur.end(), by_logit);
+    } else {
+        std::sort(cur.begin(), head, by_logit);
+    }
 
     // apply softmax
-    float max_l = cur[0].logit;
     float cum_sum = 0.0f;
-    for (size_t i = 0; i < cur.size(); ++i) {
-        float p = expf(cur[i].logit - max_l);
-        cur[i].p = p;
+    for (auto it = cur.begin(); it != head; ++it) {
+        float p = expf(it->logit - max_l);
+        it->p = p;
         cum_sum += p;
     }
-    for (size_t i = 0; i < cur.size(); ++i) {
-        cur[i].p /= cum_sum;
+    for (auto it = cur.begin(); it != head; ++it) {
+        it->p /= cum_sum;
+    }
+    for (const auto & t : cur) {
+        if (t.id == token) {
+            float p = expf(t.logit - max_l);
+            token_p = p / cum_sum;
+            break;
+        }
     }
 
+    cur.erase(head, cur.end());
     return cur;
 }
 

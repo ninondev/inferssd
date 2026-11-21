@@ -12,6 +12,7 @@
 #include <memory>
 #include <set>
 #include <functional>
+#include <limits>
 #include <map>
 
 struct ggml_cgraph;
@@ -20,8 +21,8 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
-struct llama_kimi_cpu_sink_node;
-struct llama_kimi_cpu_sink_runtime;
+struct llama_ssd_cpu_sink_node;
+struct llama_ssd_cpu_sink_runtime;
 
 struct llama_memory_context_i;
 
@@ -63,6 +64,17 @@ enum llm_norm_type {
     LLM_NORM_GROUP,
 };
 
+// The selected expert scores can be much smaller than the F16 floor in
+// DeepSeek-V4.1. Preserve its Gate.forward denominator without changing the
+// historical zero guard used by other architectures.
+inline ggml_tensor * llm_moe_weights_denominator(
+        ggml_context * ctx, ggml_tensor * weights_sum, llm_arch arch) {
+    if (arch == LLM_ARCH_DEEPSEEK41) {
+        return ggml_scale_bias(ctx, weights_sum, 1.0f, 1e-20f);
+    }
+    return ggml_clamp(ctx, weights_sum, 6.103515625e-5f, std::numeric_limits<float>::infinity());
+}
+
 // TODO: tmp - need something better to pass the data from the encoder to the decoder
 struct llama_cross {
     // the output embeddings from the encoder as a ggml tensor
@@ -97,6 +109,10 @@ public:
 
     virtual void set_input(const llama_ubatch * ubatch) = 0;
 
+    // Before the graph takes its memory: the reads of the rows this input will gather for the ubatch are issued
+    // (llama_prefetch_rows), so that they overlap the reservation and what runs before the rows are used.
+    virtual void prefetch(const llama_ubatch * ubatch) { GGML_UNUSED(ubatch); }
+
     // return true if the resulting input tensors using the provided graph parameters would be
     //   the same as the previous input tensors that we have currently stored in the object
     virtual bool can_reuse(const llm_graph_params & params) {
@@ -118,11 +134,15 @@ public:
     virtual ~llm_graph_input_embd() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    void prefetch(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
+
+    // the token embedding where it is host memory: a batch's rows are prefetched (llama_prefetch_rows)
+    const ggml_tensor * table = nullptr;
 
     const int64_t n_embd = 0;
 };
@@ -280,9 +300,9 @@ public:
     ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
 
     // n_tokens == n_batch
-    ggml_tensor * self_kq_mask         = nullptr; // F32 [n_tokens, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask         = nullptr; // F32/F16 [n_tokens, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv     = nullptr; //     [n_tokens, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_swa     = nullptr; // F32 [n_tokens, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_tokens, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa_cnv = nullptr; //     [n_tokens, n_batch/n_stream, 1, n_stream]
 
     const llama_hparams hparams;
@@ -313,7 +333,7 @@ public:
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
-    ggml_tensor * self_kq_mask     = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //     [n_kv, n_batch/n_stream, 1, n_stream]
 
     // note: assumes v_rot^2 == I
@@ -353,7 +373,7 @@ public:
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
 
-    ggml_tensor * self_kq_mask     = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //     [n_kv, n_batch/n_stream, 1, n_stream]
 
     const llama_hparams hparams;
@@ -391,9 +411,9 @@ public:
     ggml_tensor * self_k_idxs_swa = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs_swa = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
-    ggml_tensor * self_kq_mask         = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask         = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv     = nullptr; //     [n_kv, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_swa     = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa_cnv = nullptr; //     [n_kv, n_batch/n_stream, 1, n_stream]
 
     ggml_tensor * self_k_rot = nullptr;
@@ -427,7 +447,7 @@ public:
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
 
     // fork: the mask is filled as F32 (llama_kv_cache::set_input_kq_mask) and cast to F16 for flash attention
-    ggml_tensor * self_kq_mask     = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //     [n_kv, n_batch/n_stream, 1, n_stream] (F16 with flash attention)
 
     ggml_tensor * self_k_rot = nullptr;
@@ -496,7 +516,7 @@ public:
 
     ggml_tensor * get_kq_mask_cross() const { return cross_kq_mask_cnv; }
 
-    ggml_tensor * cross_kq_mask     = nullptr; // F32 [n_outputs_enc, n_batch, 1, 1]
+    ggml_tensor * cross_kq_mask     = nullptr; // F32/F16 [n_outputs_enc, n_batch, 1, 1]
     ggml_tensor * cross_kq_mask_cnv = nullptr; // F32 [n_outputs_enc, n_batch, 1, 1]
 
     const llama_cross * cross = nullptr;
@@ -652,7 +672,8 @@ struct llm_graph_params {
 
     bool cpu_sink_decode = false;
     bool cpu_sink_prefill = false;
-    llama_kimi_cpu_sink_runtime * cpu_sink_runtime = nullptr;
+    bool cpu_sink_prefill_hint = false; // a sink prefill predicts each next layer's routes (prefill.lookahead)
+    llama_ssd_cpu_sink_runtime * cpu_sink_runtime = nullptr;
 
     llm_graph_cb cb;
 
@@ -719,6 +740,7 @@ struct llm_graph_params {
         return
             cpu_sink_decode == other.cpu_sink_decode &&
             cpu_sink_prefill == other.cpu_sink_prefill &&
+            cpu_sink_prefill_hint == other.cpu_sink_prefill_hint &&
             cpu_sink_runtime == other.cpu_sink_runtime &&
             cparams.embeddings  == other.cparams.embeddings  &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
@@ -754,6 +776,7 @@ public:
     void reset();
 
     void set_inputs(const llama_ubatch * ubatch);
+    void prefetch_inputs(const llama_ubatch * ubatch);
     void set_outputs(const llm_graph_params & params);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it
@@ -784,7 +807,7 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
 
-    std::vector<std::unique_ptr<llama_kimi_cpu_sink_node>> cpu_sink_nodes;
+    std::vector<std::unique_ptr<llama_ssd_cpu_sink_node>> cpu_sink_nodes;
 
     ggml_context_ptr ctx_compute;
 
@@ -854,9 +877,10 @@ struct llm_graph_context {
     const int64_t n_outputs;
     const bool cpu_sink_decode;
     const bool cpu_sink_prefill;
-    llama_kimi_cpu_sink_runtime * const cpu_sink_runtime;
-    // Set by a model around its build_moe_ffn call: the next layer's predicted experts for the CPU sink's
-    // prefetch and its hint statistics (single-token decode only).
+    const bool cpu_sink_prefill_hint;
+    llama_ssd_cpu_sink_runtime * const cpu_sink_runtime;
+    // Set by a model around its build_moe_ffn call: the next layer's predicted experts for the CPU sink, a decode
+    // token's for its prefetch, every token's of a sink prefill for its read-ahead.
     ggml_tensor * cpu_sink_prefetch_hint = nullptr;
     const int32_t n_ctx_orig; // yarn
 

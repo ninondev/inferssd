@@ -58,9 +58,13 @@ struct llama_memory_context_i {
     // Precompute metadata transaction. Capturing may allocate but cannot
     // publish cells; cancellation after apply must not allocate. Tensor/state
     // writes are excluded: discard the undo immediately before async submit.
-    virtual bool save_precompute() { return false; }
-    virtual bool restore_precompute() noexcept { return false; }
-    virtual void discard_precompute() noexcept {}
+    // Every memory type implements it: a ubatch whose graph gets no memory is
+    // undone and its batch split again (prefill_refit) on every model, and only
+    // what is saved differs by memory type. save_precompute returns false only
+    // for a context with no ubatches, which applies nothing to undo.
+    virtual bool save_precompute() = 0;
+    virtual bool restore_precompute() noexcept = 0;
+    virtual void discard_precompute() noexcept = 0;
 
     [[nodiscard]] bool apply_precompute() {
         precompute_state = state::untouched;
@@ -154,6 +158,32 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
+
+    //
+    // cells allocated as they are used (llama_kv_cache)
+    //
+
+    // Asked before the cache allocates more memory: room for `host_bytes` of host memory and `device_bytes` of device
+    // memory, then `allocate`, which fails when a device has no memory left. False refuses, and the batch that needed
+    // the cells fails. Without one, the cells are just allocated.
+    using commit_cb = std::function<bool(size_t host_bytes, size_t device_bytes, const std::function<bool()> & allocate)>;
+    virtual void set_commit(const commit_cb & commit) { (void) commit; }
+
+    // whether the memory allocates its cells as they are used (or would, sized without allocating: no_alloc), so that
+    // a larger context costs memory only once it is filled
+    virtual bool get_can_grow() const { return false; }
+
+    // whether n_tokens more tokens than the memory holds now need cells it has not allocated yet
+    virtual bool cells_short(uint32_t n_tokens) const { (void) n_tokens; return false; }
+
+    // allocates the cells for n_tokens more tokens than the memory holds now; false when there is no memory for them
+    virtual bool reserve_cells(uint32_t n_tokens) { (void) n_tokens; return true; }
+
+    // as reserve_cells, at a request's start: the cells past those, which hold nothing, are given back as well
+    virtual bool fit_cells(uint32_t n_tokens) { return reserve_cells(n_tokens); }
+
+    // changes whenever the cells the memory has allocated change: graphs reserved before were sized for the old ones
+    virtual uint32_t get_generation() const { return 0; }
 
     //
     // state write/read

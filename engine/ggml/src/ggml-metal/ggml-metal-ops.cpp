@@ -375,6 +375,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                 n_fuse = ggml_metal_op_norm(ctx, idx);
             } break;
         case GGML_OP_ROPE:
+        case GGML_OP_ROPE_BACK:
             {
                 n_fuse = ggml_metal_op_rope(ctx, idx);
             } break;
@@ -2640,9 +2641,10 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
     return res;
 }
 
-int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
-    ggml_tensor * op = ctx->node(idx);
-
+// One encoding of a flash attention over the query rows that op holds. The extra buffers (padding, mask blocks,
+// workgroup results) are the ones of the whole attention (ggml_metal_op_flash_attn_ext).
+static int ggml_metal_op_flash_attn_ext_rows(ggml_metal_op_t ctx, ggml_tensor * op,
+        ggml_metal_buffer_id bid_pad, ggml_metal_buffer_id bid_blk, ggml_metal_buffer_id bid_tmp) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
@@ -2704,15 +2706,6 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     ggml_metal_buffer_id bid_src4 = has_sinks ? ggml_metal_get_buffer_id(op->src[4]) : bid_src0;
 
     ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(op);
-
-    ggml_metal_buffer_id bid_pad = bid_dst;
-    bid_pad.offs += ggml_nbytes(op);
-
-    ggml_metal_buffer_id bid_blk = bid_pad;
-    bid_blk.offs += ggml_metal_op_flash_attn_ext_extra_pad(op);
-
-    ggml_metal_buffer_id bid_tmp = bid_blk;
-    bid_tmp.offs += ggml_metal_op_flash_attn_ext_extra_blk(op);
 
     if (!ggml_metal_op_flash_attn_ext_use_vec(op)) {
         // half8x8 kernel
@@ -3065,6 +3058,67 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             }
         }
 #undef FATTN_SMEM
+    }
+
+    return 1;
+}
+
+// rows [r0, r0 + rows) of t along dim, as a tensor at the same place in the same buffer
+static ggml_tensor ggml_metal_op_row_range(const ggml_tensor * t, int dim, int64_t r0, int64_t rows) {
+    ggml_tensor range = *t;
+    const size_t offset = (size_t) r0 * t->nb[dim];
+    range.ne[dim] = rows;
+    range.data = (char *) t->data + offset;
+    if (t->view_src) {
+        range.view_offs += offset;
+    }
+    return range;
+}
+
+// The flash attention kernel holds a query row's index in 16 bits (ushort iq1), so one encoding takes fewer than 65536
+// query rows. A prompt of more tokens in one ubatch runs as encodings over ranges of its rows, each from its rows of q,
+// the mask and dst. A range starts at a multiple of 32 rows, which the row tiles of the kernel divide, so each range
+// computes what its rows get in one encoding; the ranges share the extra buffers, so each waits for the one before.
+static constexpr int64_t METAL_FA_MAX_ROWS = 65536 - 32;
+
+int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_buffer_id bid_pad = ggml_metal_get_buffer_id(op);
+    bid_pad.offs += ggml_nbytes(op);
+
+    ggml_metal_buffer_id bid_blk = bid_pad;
+    bid_blk.offs += ggml_metal_op_flash_attn_ext_extra_pad(op);
+
+    ggml_metal_buffer_id bid_tmp = bid_blk;
+    bid_tmp.offs += ggml_metal_op_flash_attn_ext_extra_blk(op);
+
+    const ggml_tensor * q    = op->src[0];
+    const ggml_tensor * mask = op->src[3];
+    const int64_t N = q->ne[1];
+    if (N <= METAL_FA_MAX_ROWS) {
+        return ggml_metal_op_flash_attn_ext_rows(ctx, op, bid_pad, bid_blk, bid_tmp);
+    }
+
+    // the kernel addresses q, the mask and dst as one block of rows per sequence
+    GGML_ASSERT(q->ne[3] == 1 && op->ne[3] == 1 && (!mask || (mask->ne[2] == 1 && mask->ne[3] == 1)));
+
+    const int64_t ranges = (N + METAL_FA_MAX_ROWS - 1) / METAL_FA_MAX_ROWS;
+    const int64_t rows   = ((N + ranges - 1) / ranges + 31) / 32 * 32;
+    for (int64_t r0 = 0; r0 < N; r0 += rows) {
+        const int64_t r1 = std::min(N, r0 + rows);
+        if (r0 > 0) {
+            ggml_metal_op_concurrency_reset(ctx);
+        }
+        ggml_tensor q_range = ggml_metal_op_row_range(q, 1, r0, r1 - r0);
+        ggml_tensor mask_range;
+        if (mask) {
+            mask_range = ggml_metal_op_row_range(mask, 1, r0, (r1 == N ? mask->ne[1] : r1) - r0);
+        }
+        ggml_tensor op_range = ggml_metal_op_row_range(op, 2, r0, r1 - r0);
+        op_range.src[0] = &q_range;
+        op_range.src[3] = mask ? &mask_range : nullptr;
+        ggml_metal_op_flash_attn_ext_rows(ctx, &op_range, bid_pad, bid_blk, bid_tmp);
     }
 
     return 1;
@@ -3531,6 +3585,11 @@ int ggml_metal_op_rope(ggml_metal_op_t ctx, int idx) {
     const int sect_2 = ((const int32_t *) op->op_params)[13];
     const int sect_3 = ((const int32_t *) op->op_params)[14];
 
+    const int n_offs = ((const int32_t *) op->op_params)[15];
+
+    // when dst aliases src0, the channels outside the rotated window already hold the correct data
+    const bool inplace = op->data == op->src[0]->data;
+
     ggml_metal_kargs_rope args = {
         /*.ne00        =*/ ne00,
         /*.ne01        =*/ ne01,
@@ -3550,6 +3609,7 @@ int ggml_metal_op_rope(ggml_metal_op_t ctx, int idx) {
         /*.nb3         =*/ nb3,
         /*.n_past      =*/ n_past,
         /*.n_dims      =*/ n_dims,
+        /*.n_offs      =*/ n_offs,
         /*.n_ctx_orig  =*/ n_ctx_orig,
         /*.freq_base   =*/ freq_base,
         /*.freq_scale  =*/ freq_scale,
@@ -3562,6 +3622,7 @@ int ggml_metal_op_rope(ggml_metal_op_t ctx, int idx) {
         /* sect_2      =*/ sect_2,
         /* sect_3      =*/ sect_3,
         /* src2        =*/ op->src[2] != nullptr,
+        /* inplace     =*/ inplace,
     };
 
     auto pipeline = ggml_metal_library_get_pipeline_rope(lib, op);

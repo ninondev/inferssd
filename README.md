@@ -7,29 +7,90 @@
 </p>
 
 <p align="center">
+  <a href="https://wici.ai/wici-infer#app-download"><b>Download app</b></a> &nbsp;·&nbsp;
   <a href="https://wici.ai/inferssd"><b>Website</b></a> &nbsp;·&nbsp;
   <a href="https://wici.ai/research"><b>Blog</b></a> &nbsp;·&nbsp;
+  <a href="https://discord.gg/wici"><b>Discord</b></a> &nbsp;·&nbsp;
   <a href="https://join.slack.com/t/wici-ai/shared_invite/zt-4f2e7ob2s-9nUg35Phqyqt4EI6qUjw5w"><b>Slack</b></a> &nbsp;·&nbsp;
   <a href="LICENSE">Apache-2.0</a> &nbsp;·&nbsp;
   <a href="docs/README.zh-CN.md">简体中文</a>
 </p>
-<p align="center">macOS / Metal &nbsp;·&nbsp; Linux / CUDA &nbsp;·&nbsp; Windows (in progress)</p>
+<p align="center">macOS (Metal) &nbsp;·&nbsp; Windows 10/11 (CUDA · Vulkan · ROCm in progress) &nbsp;·&nbsp; Linux (CUDA · ROCm · Vulkan in progress)</p>
 
-**Run models larger than your RAM or VRAM.** InferSSD builds on [llama.cpp](https://github.com/ggml-org/llama.cpp) to run large mixture-of-experts (MoE) models from SSD, using standard GGUF files, with browser chat and an OpenAI-compatible API. It currently supports **DeepSeek-V4.1-Flash-1017**, **Muse-Spark-Open** and **Qwen3.6-35B-A3B**, with more models coming.
+**Run models larger than your RAM or VRAM.** InferSSD builds on [llama.cpp](https://github.com/ggml-org/llama.cpp) to run large mixture-of-experts (MoE) models from SSD, using standard GGUF files, with browser chat and an OpenAI-compatible API. It runs **DeepSeek-V4.1-Flash-1017** and **Qwen3.8 Flash Next** in many quantizations, as well as **Muse-Spark-Open**, **Qwen3.6-35B-A3B** and **Gemma4 E4B**.
 
 ## Models
 
-These are the tested GGUF files, community conversions of the named model releases. DeepSeek's Q8_0 keeps the official bit widths: routed experts stay native 4-bit MXFP4, and FP8 tensors become 8-bit Q8_0. See [weight-format details](docs/benchmark.md#checkpoint-formats).
+These are the tested GGUF files, used as their publishers released them. Expand a model for its files.
 
-| Model | Parameter count | GGUF reference |
-| --- | --- | --- |
-| DeepSeek-V4.1-Flash-1017 | 763B total / 8–16B active | [mrfakename · Q8_0](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF) |
-| Muse-Spark-Open | 816B total / 42B active | [Unsloth · UD-Q4_K_XL](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF) |
-| Qwen3.6-35B-A3B | 35B total / 3B active | [Unsloth · UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) |
+<details>
+<summary><b>DeepSeek-V4.1-Flash-1017</b> · 763B total / 8–16B active · 10 GGUFs</summary>
+
+| Quantization | Publisher | Size (GB) |
+| --- | --- | ---: |
+| [UD-IQ1_S](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/UD-IQ1_S) | [Unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) | 233.0 |
+| [UD-IQ1_M](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/UD-IQ1_M) | [Unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) | 250.4 |
+| [UD-IQ2_XXS](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/UD-IQ2_XXS) | [Unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) | 300.5 |
+| [UD-Q2_K_XL](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/UD-Q2_K_XL) | [Unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) | 334.8 |
+| [UD-IQ3_XXS](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/UD-IQ3_XXS) | [Unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) | 394.7 |
+| [UD-IQ3_S](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/UD-IQ3_S) | [Unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) | 423.6 |
+| [UD-Q3_K_XL](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/UD-Q3_K_XL) | [Unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) | 485.1 |
+| [UD-Q4_K_XL](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/UD-Q4_K_XL) | [Unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) | 500.7 |
+| [Q8_0](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/Q8_0) | [mrfakename](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF) | 508.0 |
+| [UD-Q8_K_XL](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/UD-Q8_K_XL) | [Unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) | 508.4 |
+
+mrfakename's Q8_0 keeps the official bit widths: routed experts stay native 4-bit MXFP4, and FP8 tensors become 8-bit Q8_0. See [weight-format details](docs/benchmark.md#checkpoint-formats).
+
+</details>
+
+<details>
+<summary><b>Muse-Spark-Open</b> · 816B total / 42B active · 1 GGUF</summary>
+
+| Quantization | Publisher | Size (GB) |
+| --- | --- | ---: |
+| [UD-Q4_K_XL](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF/tree/main/UD-Q4_K_XL) | [Unsloth](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF) | 505.5 |
+
+</details>
+
+<details>
+<summary><b>Qwen3.8 Flash Next</b> · 177B total / A3B · 10 GGUFs</summary>
+
+| Quantization | Publisher | Size (GB) |
+| --- | --- | ---: |
+| [UD-IQ1_S](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-IQ1_S) | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 66.4 |
+| [UD-IQ1_M](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-IQ1_M) | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 68.0 |
+| [UD-Q2_0](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-Q2_0) | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 70.5 |
+| [UD-IQ2_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-IQ2_XS) | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 75.8 |
+| [UD-Q2_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-Q2_K_XL) | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 79.6 |
+| [UD-IQ3_XXS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-IQ3_XXS) | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 83.6 |
+| [UD-Q3_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-Q3_K_XL) | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 89.5 |
+| [UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-IQ4_XS) | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 93.7 |
+| [IQ4_XS](https://huggingface.co/bartowski/Qwen3.8-Flash-Next-GGUF/tree/main/Qwen3.8-Flash-Next-IQ4_XS) | [Bartowski](https://huggingface.co/bartowski/Qwen3.8-Flash-Next-GGUF) | 97.7 |
+| [UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-Q4_K_XL) | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 111.3 |
+
+</details>
+
+<details>
+<summary><b>Qwen3.6-35B-A3B</b> · 35B total / 3B active · 1 GGUF</summary>
+
+| Quantization | Publisher | Size (GB) |
+| --- | --- | ---: |
+| [UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/blob/main/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf) | [Unsloth](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF) | 22.4 |
+
+</details>
+
+<details>
+<summary><b>Gemma4 E4B</b> · 7.46B total / E4B · 1 GGUF</summary>
+
+| Quantization | Publisher | Size (GB) |
+| --- | --- | ---: |
+| [QAT Q4_0](https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf/blob/main/gemma-4-E4B_q4_0-it.gguf) | [Google](https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf) | 5.2 |
+
+</details>
 
 ## Performance benchmarks
 
-**4K prompt tier · 256 output tokens · decode measured over tokens 129–256.** All rates are in **token/s**; higher is faster. The multiple next to each **InferSSD** rate is its speedup over llama.cpp on the same hardware. On the MacBook Pro, Colibri runs the official Safetensors on CPU; llama.cpp and InferSSD run the GGUF with Metal. See [measurement details](docs/benchmark.md).
+**4K prompt tier · 256 output tokens · decode measured over tokens 129–256.** All rates are in **token/s**; higher is faster. The multiple next to each **InferSSD** rate is its speedup over llama.cpp on the same hardware. On every machine, llama.cpp and InferSSD run DeepSeek's [mrfakename Q8_0](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF/tree/main/Q8_0) and Muse's [Unsloth UD-Q4_K_XL](https://huggingface.co/unsloth/Muse-Spark-Open-816B-A42B-GGUF/tree/main/UD-Q4_K_XL); on the MacBook Pro they run them with Metal, and Colibri runs the official Safetensors on CPU. See [measurement details](docs/benchmark.md).
 
 ### Test hardware
 
@@ -42,7 +103,7 @@ These are the tested GGUF files, community conversions of the named model releas
 
 Unified memory is shared by the CPU and GPU. SSD capacities are nominal. See [hardware details](docs/benchmark.md#hardware-details) for SSD models, CPU core layouts, and configuration notes.
 
-### DeepSeek-V4.1-Flash-1017
+### DeepSeek-V4.1-Flash-1017 · mrfakename Q8_0
 
 <table>
 <thead>
@@ -57,7 +118,7 @@ Unified memory is shared by the CPU and GPU. SSD capacities are nominal. See [ha
 </tbody>
 </table>
 
-### Muse-Spark-Open
+### Muse-Spark-Open · Unsloth UD-Q4_K_XL
 
 <table>
 <thead>
@@ -76,15 +137,21 @@ Unified memory is shared by the CPU and GPU. SSD capacities are nominal. See [ha
 
 ## Get started
 
-Install on Apple Silicon macOS or on Linux with an NVIDIA GPU:
+**Desktop app.** [WiCi Infer](https://wici.ai/wici-infer) is a free app for macOS (Apple silicon) and Windows (x64), built on InferSSD. It sets up the engine, downloads models and runs chat, with no terminal. [Download for macOS](https://appapi.wici.ai/versioning/wici-infer/redirect/macos-latest) · [Download for Windows](https://appapi.wici.ai/versioning/wici-infer/redirect/windows-latest)
+
+**Command line.** On macOS or Linux:
 
 ```sh
 curl -fsSL https://github.com/wici-ai/inferssd/releases/latest/download/install.sh | sh
 ```
 
-InferSSD currently installs from source, so the engine is compiled for your machine's CPU and GPU; prebuilt packages are not available yet. Building takes about 2 to 12 minutes, depending on the machine.
+On Windows, in PowerShell:
 
-The installer works in a private environment and uses no `sudo`. It needs Git, Python 3.9 or later, and a C/C++ compiler. macOS also needs the Xcode Command Line Tools; Linux also needs the CUDA toolkit, `liburing` headers, and systemd with cgroup v2. Follow the printed PATH instruction if it shows one.
+```powershell
+irm https://github.com/wici-ai/inferssd/releases/latest/download/install.ps1 | iex
+```
+
+On macOS 15 or later on Apple silicon and on Windows 10 or 11 x64, the installer downloads the release's prebuilt [macOS](docs/macos-package.md) or [Windows](docs/windows-package.md) package, with no developer tools. On Linux it builds the release from source for the machine's CPU and GPU, which takes about 2 to 12 minutes and needs Git, Python 3.9 or later, a C/C++ compiler, systemd with cgroup v2, and the CUDA toolkit or the ROCm HIP SDK for the GPU. The installer works in a private environment and uses no `sudo`. Follow the printed PATH instruction if it shows one.
 
 Then start a model:
 
@@ -96,9 +163,16 @@ inferssd cli -hf mrfakename/DeepSeek-V4.1-Flash-1017-GGUF
 inferssd serve -hf mrfakename/DeepSeek-V4.1-Flash-1017-GGUF
 ```
 
-For Muse, use `unsloth/Muse-Spark-Open-816B-A42B-GGUF`; for Qwen3.6, `unsloth/Qwen3.6-35B-A3B-GGUF`. With `serve`, open `http://127.0.0.1:8080` in your browser, or point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`.
+`-hf` downloads and runs `mrfakename/DeepSeek-V4.1-Flash-1017-GGUF` (Q8_0), `unsloth/Muse-Spark-Open-816B-A42B-GGUF` (UD-Q4_K_XL), `unsloth/Qwen3.6-35B-A3B-GGUF` (UD-Q4_K_XL), `bartowski/Qwen3.8-Flash-Next-GGUF` (IQ4_XS) and `google/gemma-4-E4B-it-qat-q4_0-gguf`. For any other file in [Models](#models), download all of its files to one folder and pass the first with `-m`:
 
-The first run downloads the model files (about 470 GiB for DeepSeek or Muse, 21 GiB for Qwen3.6) to `~/.local/share/inferssd/models` and measures your machine. Use `--model-dir /path/on/ssd` to choose the drive, or `-m /path/to/first-shard.gguf` for files you already have. There is no memory setting to choose: InferSSD uses the memory available. Stop with **Ctrl+C**, or `/exit` in chat.
+```sh
+hf download unsloth/DeepSeek-V4.1-Flash-1017-GGUF --include "UD-IQ1_S/*" --local-dir ~/models/deepseek
+inferssd serve -m ~/models/deepseek/UD-IQ1_S/DeepSeek-V4.1-Flash-1017-UD-IQ1_S-00001-of-00005.gguf
+```
+
+With `serve`, open `http://127.0.0.1:8080` in your browser, or point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`. Add `--host 0.0.0.0` to reach it from other devices on your network; the API has no authentication, so anyone who can reach the port can use it.
+
+The first `-hf` run downloads the model files to `~/.local/share/inferssd/models` (`%LOCALAPPDATA%\inferssd\models` on Windows) and measures your machine. Use `--model-dir /path/on/ssd` to choose the drive. There is no memory setting to choose: InferSSD uses the memory available. Stop with **Ctrl+C**, or `/exit` in chat.
 
 See the [quick start](docs/quickstart.md#one-command-installation) for upgrades and uninstalling.
 
@@ -106,6 +180,8 @@ See the [quick start](docs/quickstart.md#one-command-installation) for upgrades 
 
 - [How it works](docs/architecture.md)
 - [Benchmark methodology](docs/benchmark.md)
+- [Quick start](docs/quickstart.md)
+- [Versions and engine resources](docs/engine-resources.md)
 
 ## Contributing
 

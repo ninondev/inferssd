@@ -105,9 +105,15 @@ struct llama_model_loader {
     // Set by load_tensors while expert loading is deferred for an SSD executor: the
     // routed-expert tensors take the plain CPU buffer type, an ordinary mmap.
     bool map_deferred_experts = false;
+    // Set for a model whose SSD context homes the layers' matrices (llama_model_params::ssd_homes): a repeating
+    // layer's matrix (a weight of a matrix product) that a discrete GPU whose backend streams would hold takes the
+    // plain CPU buffer type instead, the mapped GGUF under mmap; homed_matrices lists each with its layer.
+    bool home_layer_matrices = false;
+    std::vector<std::pair<int, ggml_tensor *>> homed_matrices;
     bool no_alloc;
 
     llama_files files;
+    std::vector<std::string> paths; // files[i]'s path: load_all_data opens its own handles under mmap
     llama_ftype ftype;
     llama_fver  fver;
 
@@ -215,6 +221,10 @@ struct llama_model_loader {
 
     void done_getting_tensors() const;
 
+    // Forget the tensors of blocks [first, first + count), as if the file had none: the counts, the
+    // mappings and every lookup exclude them from then on. Returns their number and bytes.
+    std::pair<size_t, size_t> drop_blocks(uint32_t first, uint32_t count);
+
     void build_expert_tensor_index(const llama_hparams & hparams);
     bool should_defer_expert_mmaps() const;
     void drop_mmap_expert_pages() const;
@@ -225,9 +235,10 @@ struct llama_model_loader {
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 
     void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
-    // Whether the file range a mapped buffer of ctx's tensors would span holds routed experts that
-    // live outside ctx, which that one mapping would pin as well.
-    bool mapping_range_encloses_experts(ggml_context * ctx) const;
+    // Whether the file range a mapped buffer of ctx's tensors would span holds tensors that live
+    // outside ctx unpinned, routed experts or a lazily mapped PLE table, which that one mapping
+    // would pin as well.
+    bool mapping_range_encloses_unpinned(ggml_context * ctx) const;
 
     // for backwards compatibility, does not support ggml-backend
     void load_data_for(struct ggml_tensor * cur) const;

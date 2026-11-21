@@ -11,6 +11,11 @@ A descriptor is ordinary JSON. Relative paths resolve against its own directory:
   "schema": "inferssd-engine 1",
   "binary": "bin/inferssd-server",
   "revision": "the-deployed-source-revision",
+  "version": "261119.301",
+  "tag": null,
+  "build": 301,
+  "date": "2026-11-19",
+  "branch": "main",
   "templates": {
     "dsv": "templates/deepseek-ai-DeepSeek-V4.1.jinja",
     "muse": "templates/muse-spark.jinja"
@@ -25,9 +30,30 @@ A descriptor is ordinary JSON. Relative paths resolve against its own directory:
 }
 ```
 
+`revision`, `build`, `date` and `branch` say which source the engine was built
+from: the commit, the branch's commit count up to it, the commit's day (UTC) and
+the branch. `scripts/engine-resources.py` reads them from the checkout's Git
+metadata, so a local build and the installer's build record them the same way;
+`inferssd --version --json` reports them, with the build's `label`,
+`<yymmdd>.<build>.<commit>`. A shallow clone counts only the commits it
+has, so the installer clones with `--filter=blob:none`; a source archive has no
+Git metadata, and the four are `"unknown"` and `null`. The WiCi AI desktop app
+decides on its own, by `build`, whether an engine is one it works with; the
+engine does not know the app.
+
+`version` is `<yymmdd>.<build>`, the commit's day and the build number:
+`261119.301`. `inferssd --version` prints it with the commit,
+`inferssd 261119.301 (61a66d5)`. `tag` says the build is a release: a release's
+tag is its version, so a build of a released commit has the tag `261119.301`;
+the Release workflow, which creates the tag once the packages are published,
+passes it to the packages it builds in `INFERSSD_RELEASE_TAG`. Any other build
+has no tag. Without Git metadata, both are `null` and `inferssd --version`
+reports the framework's own version.
+
 Use `darwin` for an Apple Silicon deployment and `windows` for a Windows one.
 `gpu_backends` lists the GPU backends the engine was built with, of `CUDA`,
-`Metal` and `Vulkan`; an empty list is a CPU-only build. The launch takes the CUDA
+`Metal` and `Vulkan`; an empty list is a CPU-only build, and `inferssd --version --json`
+reports the list under `capabilities`. The launch takes the CUDA
 expert tier's settings only from an engine that has `CUDA`. Without the field,
 the launch reads the backends from the `CMakeCache.txt` of the build holding the
 server; when neither says, the launch strategy takes them to be those of the

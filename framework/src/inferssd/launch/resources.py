@@ -11,20 +11,26 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from inferssd.configuration.settings import PLATFORMS
+from inferssd.configuration.settings import PLATFORMS, host_platform
 
 # A checkout's build directories, searched in this order: the presets first,
 # then the conventional ad hoc ones.
 BUILDS = {
-    "linux": ("build-linux-cuda", "build-linux-cpu", "build"),
+    "linux": ("build-linux-cuda", "build-linux-rocm", "build-linux-cpu", "build"),
     "darwin": ("build-macos-metal", "build-mac", "build"),
-    "windows": ("build-x64-windows-llvm-release", "build"),
+    "windows": ("build-windows-llvm", "build-x64-windows-llvm-release", "build"),
 }
 # The machine probes by the name a resource descriptor's probes map gives them.
 PROBES = {"ssd": "inferssd-ssdprobe", "cpu": "inferssd-cpuprobe", "memory": "inferssd-memprobe"}
 # The GPU backends an engine can be built with, by the name the machine identity
-# gives a GPU's backend, and the CMake option that builds each.
-GPU_BACKENDS = {"CUDA": "GGML_CUDA", "Metal": "GGML_METAL", "Vulkan": "GGML_VULKAN"}
+# gives a GPU's backend, and the CMake option that builds each: ROCm is ggml's HIP
+# backend, which names its devices ROCm0, ROCm1 and so on.
+GPU_BACKENDS = {
+    "CUDA": "GGML_CUDA",
+    "ROCm": "GGML_HIP",
+    "Metal": "GGML_METAL",
+    "Vulkan": "GGML_VULKAN",
+}
 
 
 def cmake_gpu_backends(cache: str) -> tuple[str, ...]:
@@ -40,9 +46,39 @@ def cmake_gpu_backends(cache: str) -> tuple[str, ...]:
     )
 
 
-def data_directory(environ: Mapping[str, str] = os.environ, home: Optional[Path] = None) -> Path:
+def data_directory(
+    environ: Mapping[str, str] = os.environ,
+    home: Optional[Path] = None,
+    platform: Optional[str] = None,
+) -> Path:
     """Where the installer keeps the releases, the models and the launch state."""
-    return Path(environ.get("INFERSSD_HOME", (home or Path.home()) / ".local/share/inferssd"))
+    named = environ.get("INFERSSD_HOME")
+    if named:
+        return Path(named)
+    home = home or Path.home()
+    if (platform or host_platform()) == "windows":
+        local = environ.get("LOCALAPPDATA")
+        return (Path(local) if local else home / "AppData" / "Local") / "inferssd"
+    return home / ".local/share/inferssd"
+
+
+def cache_directory(
+    environ: Mapping[str, str] = os.environ,
+    home: Optional[Path] = None,
+    platform: Optional[str] = None,
+) -> Path:
+    """Where this user's inferssd caches live: the prompt caches and the expert indexes."""
+    home = home or Path.home()
+    name = platform or host_platform()
+    if name == "darwin":
+        root = home / "Library" / "Caches"
+    elif name == "windows":
+        local = environ.get("LOCALAPPDATA")
+        root = Path(local) if local else home / "AppData" / "Local"
+    else:
+        cache = environ.get("XDG_CACHE_HOME")
+        root = Path(cache) if cache else home / ".cache"
+    return root / "inferssd"
 
 
 def installed_resources(
@@ -63,6 +99,11 @@ class EngineResources:
     # The GPU backends the engine was built with; None in a descriptor written before they
     # were recorded.
     gpu_backends: Optional[tuple[str, ...]] = None
+    # The build the engine was made from: the branch's commit count, the commit's day and the
+    # branch; None in a descriptor written before they were recorded, or from a source archive.
+    build: Optional[int] = None
+    date: Optional[str] = None
+    branch: Optional[str] = None
 
     def template(self, profile: str) -> str:
         try:
@@ -76,7 +117,19 @@ def read_resources(path: Path) -> EngineResources:
     data: object = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict) or data.get("schema") != "inferssd-engine 1":
         raise ValueError("expected inferssd-engine 1 resource descriptor")
-    if set(data) - {"schema", "binary", "templates", "probes", "capabilities", "revision"}:
+    if set(data) - {
+        "schema",
+        "binary",
+        "templates",
+        "probes",
+        "capabilities",
+        "revision",
+        "version",
+        "tag",
+        "build",
+        "date",
+        "branch",
+    }:
         raise ValueError("unknown engine resource field")
     capabilities = data.get("capabilities")
     if not isinstance(capabilities, dict) or capabilities.get("settings") != "inferssd-settings 1":
@@ -89,6 +142,13 @@ def read_resources(path: Path) -> EngineResources:
     revision = data.get("revision", "unknown")
     if not isinstance(revision, str) or not revision:
         raise ValueError("engine revision must be nonempty text")
+    build = data.get("build")
+    if build is not None and (not isinstance(build, int) or isinstance(build, bool) or build < 1):
+        raise ValueError("engine build must be a positive integer")
+    # The version and a release's tag are reported by inferssd/version.py.
+    for key in ("version", "tag", "date", "branch"):
+        if data.get(key) is not None and (not isinstance(data[key], str) or not data[key]):
+            raise ValueError("engine " + key + " must be nonempty text")
     backends = capabilities.get("gpu_backends")
     if backends is not None and (
         not isinstance(backends, list)
@@ -117,6 +177,9 @@ def read_resources(path: Path) -> EngineResources:
         platform,
         revision,
         None if backends is None else tuple(backends),
+        build,
+        data.get("date"),
+        data.get("branch"),
     )
 
 

@@ -1,21 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """What a strategy is derived from besides the machine characteristics.
 
-``ModelFacts`` come from the GGUF header of the model being launched.
+``ModelFacts`` come from the engine's facts of the model being launched
+(inferssd.engine.model): what the engine would load, before it loads anything.
 ``RuntimeFacts`` are read when the launch starts, because they change while the
-machine runs: the CPUs this process may use, the CUDA GPUs it can use and
-their free memory, the memory available now, and the user's memory budget.
+machine runs: the CPUs this process may use, the GPUs with the expert VRAM tier
+it can use and their free memory, the memory available now, and the user's
+memory budget.
 Readers take an injectable host and never write anything.
 """
 
 from __future__ import annotations
 
 import os
-import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Optional, Protocol, cast
+from typing import Any, Optional, Protocol, cast
 
 from inferssd.configuration.settings import cpus as cpu_list
 from inferssd.contracts import ContractError
@@ -24,31 +25,25 @@ from inferssd.machine.characteristics import (
     COUNT,
     POSITIVE,
     TEXT,
-    Check,
     array,
     nullable,
     record,
 )
-from inferssd.source import header as gguf_header
-from inferssd.source.experts import ROLE, is_role, widened
-from inferssd.source.files import LOCAL_FILES, SourceFiles
 
 ROLES = ("gate", "up", "down")
-# ggml type name -> (elements per block, bytes per block)
-BLOCKS = {name: (block, size) for name, block, size in gguf_header.TYPES.values()}
 
 
 @dataclass(frozen=True)
 class Role:
-    """One routed-expert role as the header describes it.
+    """One routed-expert role as the engine lays it out.
 
     A role is a matrix of ``rows`` output features by ``cols`` reduction
-    columns per expert; ``formats`` counts the layers per ggml type, the most
-    common first.
+    columns per expert; ``formats`` gives each ggml type it takes, the layers
+    in it and one expert's bytes of the role in it, the most common type first.
     """
 
     name: str
-    formats: tuple[tuple[str, int], ...]
+    formats: tuple[tuple[str, int, int], ...]
     rows: int
     cols: int
 
@@ -58,25 +53,28 @@ class Role:
 
     def slice_bytes(self, format: Optional[str] = None) -> int:
         """One expert's bytes of this role in FORMAT (default: the most common one)."""
-        block, size = BLOCKS[format or self.format]
-        return self.rows * (self.cols // block) * size
+        name = format or self.format
+        for item, _, size in self.formats:
+            if item == name:
+                return size
+        raise KeyError(f"routed {self.name} experts take no {name}")
+
+    def bits_per_weight(self, format: Optional[str] = None) -> float:
+        return 8 * self.slice_bytes(format) / (self.rows * self.cols)
 
 
 @dataclass(frozen=True)
-class ModelFacts:
-    """Model facts from the GGUF header; nothing here depends on the machine."""
+class Experts:
+    """A model's routed experts as the engine lays them out."""
 
-    paths: tuple[str, ...]
-    architecture: Optional[str]
     layers: int  # layers with routed experts
-    experts: int  # routed experts per layer
-    experts_used: Optional[int]  # routed experts per token
+    count: int  # routed experts per layer
+    used: Optional[int]  # routed experts per token
     gate: Role
     up: Role
     down: Role
     expert_bytes: int  # the largest expert, all three roles
-    expert_read_bytes: int  # its three role reads, each widened to whole 4 KiB pages
-    dense_bytes: int  # every tensor that is not a routed expert
+    expert_read_bytes: int  # the most one expert's three role reads (whole 4 KiB pages) take
     format_bytes: tuple[tuple[str, int], ...]  # routed bytes per ggml type, the most first
 
     @property
@@ -89,14 +87,14 @@ class ModelFacts:
         return sum(size for _, size in self.format_bytes)
 
     @property
-    def mean_expert_read_bytes(self) -> float:
+    def mean_read_bytes(self) -> float:
         """What the engine reads for one routed expert on average.
 
         Layers may quantize their experts to different types, so the largest expert overstates
         the rest: this is the mean expert's bytes, widened to whole pages as the largest one's
         three role reads are. It equals expert_read_bytes when every layer has one type.
         """
-        mean = self.routed_bytes / (self.layers * self.experts)
+        mean = self.routed_bytes / (self.layers * self.count)
         return mean + self.expert_read_bytes - self.expert_bytes
 
     @property
@@ -105,165 +103,198 @@ class ModelFacts:
         return self.format_bytes[0][0]
 
 
+@dataclass(frozen=True)
+class ModelFacts:
+    """Model facts from the engine; nothing here depends on the machine."""
+
+    paths: tuple[str, ...]
+    architecture: Optional[str]
+    dense_bytes: int  # every tensor that is not a routed expert
+    # The layers' tensors (blk.N.*) that are not routed experts: bytes per ggml type, the most
+    # first. The lookup tables outside the layers (token and per-layer embeddings) are not in it.
+    layer_format_bytes: tuple[tuple[str, int], ...]
+    experts: Optional[Experts]  # None for a model without routed experts
+
+    @property
+    def cpu_format(self) -> str:
+        """The ggml type the CPU computes the most of in a token: the routed experts' dominant
+        type, or the layers' for a model without routed experts."""
+        return self.experts.dominant_format if self.experts else self.layer_format_bytes[0][0]
+
+
 def _ranked(counts: Mapping[str, int]) -> tuple[tuple[str, int], ...]:
     return tuple(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
 
 
-def facts_from_headers(headers: Sequence[gguf_header.Header]) -> ModelFacts:
-    """ModelFacts of a model whose shards have HEADERS, in shard order."""
-    if not headers:
-        raise ValueError("a model needs at least one GGUF header")
-    kv: dict[str, object] = {}
-    for item in headers:
-        for key, value in item.kv.items():
-            kv.setdefault(key, value)
-    tensors = [tensor for item in headers for tensor in item.tensors]
-    routed = [tensor for tensor in tensors if is_role(tensor)]
-    if not routed:
-        raise ValueError(f"{headers[0].path}: the model has no routed expert tensors")
-    counts = {tensor.shape[2] for tensor in routed}
-    if len(counts) != 1:
-        raise ValueError("routed expert tensors disagree on the expert count: " + str(counts))
-    experts = counts.pop()
-    formats: dict[str, Counter[str]] = {role: Counter() for role in ROLES}
-    shapes: dict[str, Counter[tuple[int, int]]] = {role: Counter() for role in ROLES}
-    per_format: Counter[str] = Counter()
-    expert: Counter[tuple[int, int]] = Counter()
-    read: Counter[tuple[int, int]] = Counter()
-    for tensor in routed:
-        match = cast(re.Match[str], ROLE.match(tensor.name))
-        layer, role = int(match.group(1)), match.group(2)
-        formats[role][tensor.type_name] += 1
-        shapes[role][(tensor.shape[1], tensor.shape[0])] += 1
-        per_format[tensor.type_name] += tensor.nbytes
-        size = tensor.nbytes // experts
-        for index in range(experts):
-            expert[(layer, index)] += size
-            read[(layer, index)] += widened(tensor.offset + index * size, size)
-    missing = [role for role in ROLES if not formats[role]]
-    if missing:
-        raise ValueError("the model has no routed " + " or ".join(missing) + " expert tensors")
-    roles = {}
-    for role in ROLES:
-        (rows, cols), _ = max(sorted(shapes[role].items()), key=lambda item: item[1])
-        ranked = _ranked(formats[role])
-        for name, _ in ranked:
-            if name not in BLOCKS or cols % BLOCKS[name][0]:
-                raise ValueError(f"routed {role} tensors of type {name} have {cols} columns")
-        roles[role] = Role(role, ranked, rows, cols)
-    architecture = kv.get("general.architecture")
-    used = kv.get(f"{architecture}.expert_used_count") if isinstance(architecture, str) else None
+def routed_tensor(layer: int, role: str) -> str:
+    return f"blk.{layer}.ffn_{role}_exps.weight"
+
+
+def facts_from_engine(model: Mapping[str, Any]) -> ModelFacts:
+    """ModelFacts of MODEL, the engine's facts of a model (inferssd.engine.model.validate)."""
+    experts = model["experts"]
+    routed: set[str] = set()
+    found: Optional[Experts] = None
+    if experts is not None:
+        formats, layers = experts["formats"], experts["layers"]
+        counts: dict[str, Counter[str]] = {role: Counter() for role in ROLES}
+        sizes: dict[str, dict[str, int]] = {role: {} for role in ROLES}
+        per_format: Counter[str] = Counter()
+        for _, index in layers:
+            for role in ROLES:
+                # ggml's type names, as the GGUF and every receipt spell them: Q4_K, MXFP4, IQ4_XS
+                name, size = formats[index][role]["type"].upper(), formats[index][role]["bytes"]
+                counts[role][name] += 1
+                sizes[role][name] = size
+                per_format[name] += size * experts["count"]
+        shapes = {
+            "gate": (experts["hidden"], experts["latent"]),
+            "up": (experts["hidden"], experts["latent"]),
+            "down": (experts["latent"], experts["hidden"]),
+        }
+        roles = {
+            role: Role(
+                role,
+                tuple((name, count, sizes[role][name]) for name, count in _ranked(counts[role])),
+                *shapes[role],
+            )
+            for role in ROLES
+        }
+        routed = {routed_tensor(layer, role) for layer, _ in layers for role in ROLES}
+        found = Experts(
+            layers=len(layers),
+            count=experts["count"],
+            used=experts["used"] or None,
+            gate=roles["gate"],
+            up=roles["up"],
+            down=roles["down"],
+            expert_bytes=experts["expert_bytes"],
+            expert_read_bytes=experts["expert_read_bytes"],
+            format_bytes=_ranked(per_format),
+        )
+    dense = [t for t in model["tensors"] if t["name"] not in routed]
+    per_type: Counter[str] = Counter()
+    for t in dense:
+        if t["name"].startswith("blk."):
+            per_type[t["type"].upper()] += t["bytes"]
+    if not per_type:
+        raise ValueError(f"{model['files'][0]}: the model has no layer tensors")
     return ModelFacts(
-        paths=tuple(item.path for item in headers),
-        architecture=architecture if isinstance(architecture, str) else None,
-        layers=len({layer for layer, _ in expert}),
-        experts=experts,
-        experts_used=used if isinstance(used, int) and not isinstance(used, bool) else None,
-        gate=roles["gate"],
-        up=roles["up"],
-        down=roles["down"],
-        expert_bytes=max(expert.values()),
-        expert_read_bytes=max(read.values()),
-        dense_bytes=sum(tensor.nbytes for tensor in tensors if not is_role(tensor)),
-        format_bytes=_ranked(per_format),
+        paths=tuple(model["files"]),
+        architecture=model["architecture"],
+        dense_bytes=sum(t["bytes"] for t in dense),
+        layer_format_bytes=_ranked(per_type),
+        experts=found,
     )
 
 
-def model_facts(path: str, *, filesystem: SourceFiles = LOCAL_FILES) -> ModelFacts:
-    """ModelFacts of the model PATH names; a split model's first shard brings all of them."""
-    return facts_from_headers(gguf_header.read_model(path, filesystem=filesystem))
-
-
-def shard_facts(paths: Sequence[str], *, filesystem: SourceFiles = LOCAL_FILES) -> ModelFacts:
-    """ModelFacts of exactly the shards PATHS, in their order."""
-    return facts_from_headers([gguf_header.read(path, filesystem=filesystem) for path in paths])
-
-
-def _type_counts(value: object, field: str) -> None:
-    """A nonempty list of [ggml type name, positive count] pairs."""
+def _formats(value: object, field: str) -> None:
+    """A nonempty list of [ggml type name, layers, one expert's bytes] triples."""
     if not isinstance(value, list) or not value:
         raise ContractError(f"{field} must be a nonempty array")
     for index, item in enumerate(value):
-        if not isinstance(item, list) or len(item) != 2 or item[0] not in BLOCKS:
-            raise ContractError(f"{field}[{index}] must be [a ggml type name, a count]")
+        if not isinstance(item, list) or len(item) != 3 or not isinstance(item[0], str):
+            raise ContractError(f"{field}[{index}] must be [a ggml type name, layers, bytes]")
+        POSITIVE(item[1], f"{field}[{index}][1]")
+        POSITIVE(item[2], f"{field}[{index}][2]")
+
+
+def _type_bytes(value: object, field: str) -> None:
+    """A nonempty list of [ggml type name, positive bytes] pairs."""
+    if not isinstance(value, list) or not value:
+        raise ContractError(f"{field} must be a nonempty array")
+    for index, item in enumerate(value):
+        if not isinstance(item, list) or len(item) != 2 or not isinstance(item[0], str):
+            raise ContractError(f"{field}[{index}] must be [a ggml type name, bytes]")
         POSITIVE(item[1], f"{field}[{index}][1]")
 
 
-PAIRS: Check = _type_counts
-ROLE_RECORD = record({"formats": PAIRS, "rows": POSITIVE, "cols": POSITIVE})
+ROLE_RECORD = record({"formats": _formats, "rows": POSITIVE, "cols": POSITIVE})
+EXPERTS_RECORD = record(
+    {
+        "layers": POSITIVE,
+        "count": POSITIVE,
+        "used": nullable(POSITIVE),
+        "roles": record({role: ROLE_RECORD for role in ROLES}),
+        "expert_bytes": POSITIVE,
+        "expert_read_bytes": POSITIVE,
+        "format_bytes": _type_bytes,
+    }
+)
 MODEL_RECORD = record(
     {
         "paths": array(TEXT, minimum=1),
         "architecture": nullable(TEXT),
-        "layers": POSITIVE,
-        "experts": POSITIVE,
-        "experts_used": nullable(POSITIVE),
-        "roles": record({role: ROLE_RECORD for role in ROLES}),
-        "expert_bytes": POSITIVE,
-        "expert_read_bytes": POSITIVE,
         "dense_bytes": COUNT,
-        "format_bytes": PAIRS,
+        "layer_format_bytes": _type_bytes,
+        "experts": nullable(EXPERTS_RECORD),
     }
 )
 
 
-def _pairs(value: Sequence[tuple[str, int]]) -> list[list[object]]:
-    return [[name, count] for name, count in value]
-
-
 def model_facts_json(facts: ModelFacts) -> dict[str, object]:
     """FACTS as a JSON object; model_facts_from reads it back."""
+    experts = facts.experts
     return {
         "paths": list(facts.paths),
         "architecture": facts.architecture,
-        "layers": facts.layers,
-        "experts": facts.experts,
-        "experts_used": facts.experts_used,
-        "roles": {
-            role.name: {"formats": _pairs(role.formats), "rows": role.rows, "cols": role.cols}
-            for role in facts.roles
-        },
-        "expert_bytes": facts.expert_bytes,
-        "expert_read_bytes": facts.expert_read_bytes,
         "dense_bytes": facts.dense_bytes,
-        "format_bytes": _pairs(facts.format_bytes),
+        "layer_format_bytes": [list(item) for item in facts.layer_format_bytes],
+        "experts": None
+        if experts is None
+        else {
+            "layers": experts.layers,
+            "count": experts.count,
+            "used": experts.used,
+            "roles": {
+                role.name: {
+                    "formats": [list(item) for item in role.formats],
+                    "rows": role.rows,
+                    "cols": role.cols,
+                }
+                for role in experts.roles
+            },
+            "expert_bytes": experts.expert_bytes,
+            "expert_read_bytes": experts.expert_read_bytes,
+            "format_bytes": [list(item) for item in experts.format_bytes],
+        },
     }
-
-
-def _ranked_pairs(value: object) -> tuple[tuple[str, int], ...]:
-    return tuple((name, count) for name, count in cast(list[tuple[str, int]], value))
 
 
 def model_facts_from(value: object) -> ModelFacts:
     """ModelFacts from their JSON object; errors name the offending field."""
     MODEL_RECORD(value, "model_facts")
-    item = cast(dict[str, object], value)
-    roles = cast(dict[str, dict[str, object]], item["roles"])
-    built = {
-        name: Role(
-            name,
-            _ranked_pairs(roles[name]["formats"]),
-            cast(int, roles[name]["rows"]),
-            cast(int, roles[name]["cols"]),
+    item = cast(dict[str, Any], value)
+    experts = cast(Optional[dict[str, Any]], item["experts"])
+    found: Optional[Experts] = None
+    if experts is not None:
+        roles = cast(dict[str, dict[str, Any]], experts["roles"])
+        built = {
+            name: Role(
+                name,
+                tuple((format, layers, size) for format, layers, size in roles[name]["formats"]),
+                roles[name]["rows"],
+                roles[name]["cols"],
+            )
+            for name in ROLES
+        }
+        found = Experts(
+            layers=experts["layers"],
+            count=experts["count"],
+            used=experts["used"],
+            gate=built["gate"],
+            up=built["up"],
+            down=built["down"],
+            expert_bytes=experts["expert_bytes"],
+            expert_read_bytes=experts["expert_read_bytes"],
+            format_bytes=tuple((name, size) for name, size in experts["format_bytes"]),
         )
-        for name in ROLES
-    }
-    for role in built.values():
-        if any(role.cols % BLOCKS[name][0] for name, _ in role.formats):
-            raise ContractError(f"model_facts.roles.{role.name}: cols fit no block of its types")
     return ModelFacts(
-        paths=tuple(cast(list[str], item["paths"])),
-        architecture=cast(Optional[str], item["architecture"]),
-        layers=cast(int, item["layers"]),
-        experts=cast(int, item["experts"]),
-        experts_used=cast(Optional[int], item["experts_used"]),
-        gate=built["gate"],
-        up=built["up"],
-        down=built["down"],
-        expert_bytes=cast(int, item["expert_bytes"]),
-        expert_read_bytes=cast(int, item["expert_read_bytes"]),
-        dense_bytes=cast(int, item["dense_bytes"]),
-        format_bytes=_ranked_pairs(item["format_bytes"]),
+        paths=tuple(item["paths"]),
+        architecture=item["architecture"],
+        dense_bytes=item["dense_bytes"],
+        layer_format_bytes=tuple((name, size) for name, size in item["layer_format_bytes"]),
+        experts=found,
     )
 
 
@@ -288,11 +319,13 @@ def model_drive_key(paths: Sequence[str], host: Optional[identity.Host] = None) 
 
 @dataclass(frozen=True)
 class GPUState:
-    """A CUDA GPU the launch can use, as it is now."""
+    """A GPU of a backend with the expert VRAM tier (identity.TIER_BACKENDS) the launch can use,
+    as it is now."""
 
     uuid: str
     free_bytes: Optional[int]  # None where the driver reports no dedicated memory
     processes: int  # compute processes running on it
+    backend: str = "CUDA"  # the backend that runs it: CUDA, or ROCm for an AMD GPU
 
 
 @dataclass(frozen=True)
@@ -300,11 +333,12 @@ class RuntimeFacts:
     """Facts read at launch; never taken from the characteristics file."""
 
     cpus: tuple[int, ...]  # CPUs this process may run on
-    gpus: Optional[tuple[GPUState, ...]]  # usable CUDA GPUs; None when they cannot be read
+    gpus: Optional[tuple[GPUState, ...]]  # usable GPUs of the tier backends; None when unreadable
     # The launcher's view of the memory available now: MemAvailable within the
-    # room of every bounded cgroup (file cache counted as reclaimable), or on
-    # macOS the free, inactive and speculative pages. None when it cannot be
-    # read. The engine sizes its caches from its own reading at run time.
+    # room of every bounded cgroup (file cache counted as reclaimable), on
+    # macOS what an allocation takes before the kernel compresses anything, and
+    # on Windows the available physical memory. None when it cannot be read.
+    # The engine sizes its caches from its own reading at run time.
     available_bytes: Optional[int]
     memory_budget_bytes: Optional[int] = None  # the user's memory budget, when given
     # The GPU backends of the engine the launch starts, as its build names them; None when
@@ -318,7 +352,10 @@ class Host(identity.Host, Protocol):
     def environment(self) -> Mapping[str, str]: ...
 
 
-GPU_RECORD = record({"uuid": TEXT, "free_bytes": nullable(COUNT), "processes": COUNT})
+# A record made before GPUs carried their backend came from nvidia-smi: CUDA's.
+GPU_RECORD = record(
+    {"uuid": TEXT, "free_bytes": nullable(COUNT), "processes": COUNT}, {"backend": TEXT}
+)
 RUNTIME_RECORD = record(
     {
         "cpus": array(COUNT, minimum=1),
@@ -336,7 +373,12 @@ def runtime_facts_json(facts: RuntimeFacts) -> dict[str, object]:
         "gpus": None
         if facts.gpus is None
         else [
-            {"uuid": gpu.uuid, "free_bytes": gpu.free_bytes, "processes": gpu.processes}
+            {
+                "uuid": gpu.uuid,
+                "free_bytes": gpu.free_bytes,
+                "processes": gpu.processes,
+                "backend": gpu.backend,
+            }
             for gpu in facts.gpus
         ],
         "available_bytes": facts.available_bytes,
@@ -361,6 +403,7 @@ def runtime_facts_from(value: object) -> RuntimeFacts:
                 cast(str, gpu["uuid"]),
                 cast(Optional[int], gpu["free_bytes"]),
                 cast(int, gpu["processes"]),
+                cast(str, gpu.get("backend", "CUDA")),
             )
             for gpu in gpus
         ),
@@ -370,7 +413,7 @@ def runtime_facts_from(value: object) -> RuntimeFacts:
 
 
 class NativeHost(identity.NativeHost):
-    """This host; ENVIRONMENT, the launch's (default: this process's), selects the CUDA GPUs."""
+    """This host; ENVIRONMENT, the launch's (default: this process's), selects the GPUs."""
 
     def __init__(self, environment: Optional[Mapping[str, str]] = None) -> None:
         self.env = environment
@@ -385,12 +428,13 @@ class NativeHost(identity.NativeHost):
 
 
 def visible_gpus(listed: Sequence[tuple[int, str]], value: Optional[str]) -> list[tuple[int, str]]:
-    """The (index, UUID) pairs CUDA_VISIBLE_DEVICES=VALUE leaves, in its order.
+    """The (index, UUID) pairs a visible-devices list VALUE leaves, in its order.
 
-    Like CUDA, the list ends at its first entry that names no GPU or one again.
-    Numbers are taken as nvidia-smi indices, which follow the PCI bus; CUDA
-    numbers devices fastest first unless CUDA_DEVICE_ORDER=PCI_BUS_ID, so on a
-    machine with different GPUs a UUID is the unambiguous choice.
+    As CUDA and ROCm read CUDA_VISIBLE_DEVICES and ROCR_VISIBLE_DEVICES, the list
+    ends at its first entry that names no GPU or one again. Numbers are taken as
+    the indices of LISTED: nvidia-smi's follow the PCI bus, and CUDA numbers
+    devices fastest first unless CUDA_DEVICE_ORDER=PCI_BUS_ID, so on a machine
+    with different GPUs a UUID is the unambiguous choice.
     """
     if value is None:
         return list(listed)
@@ -409,6 +453,59 @@ def visible_gpus(listed: Sequence[tuple[int, str]], value: Optional[str]) -> lis
 
 
 def _gpus(host: Host) -> Optional[tuple[GPUState, ...]]:
+    """The tier backends' GPUs the launch can use: NVIDIA's (nvidia-smi) and AMD's on ROCm
+    (amdkfd); None when NVIDIA's cannot be read."""
+    nvidia = _nvidia(host)
+    return None if nvidia is None else nvidia + _rocm(host)
+
+
+# amdkfd lists each process that uses an AMD GPU, with its memory on every GPU it opened. It tears
+# an entry down after the process exits, so an entry counts only while its process runs.
+KFD_PROCESSES = "/sys/class/kfd/kfd/proc"
+
+
+def _rocm(host: Host) -> tuple[GPUState, ...]:
+    """The GPUs ROCm runs (identity.amd_compute) that the launch's environment leaves visible."""
+    listed = identity.amd_compute(host)
+    if not listed:
+        return ()
+    busy: Counter[str] = Counter()
+    try:
+        processes = host.listdir(KFD_PROCESSES)
+    except OSError:
+        processes = []
+    for process in processes:
+        if not host.exists(f"/proc/{process}"):
+            continue
+        for gpu in listed:
+            if gpu.gpu_id and host.exists(f"{KFD_PROCESSES}/{process}/vram_{gpu.gpu_id}"):
+                busy[gpu.uuid] += 1
+    # ROCm applies ROCR_VISIBLE_DEVICES to amdkfd's order, then HIP_VISIBLE_DEVICES (or
+    # CUDA_VISIBLE_DEVICES, which HIP reads for it) to the devices that leaves.
+    environment = host.environment()
+    chosen = visible_gpus(
+        [(index, gpu.uuid) for index, gpu in enumerate(listed)],
+        environment.get("ROCR_VISIBLE_DEVICES"),
+    )
+    chosen = visible_gpus(
+        [(index, uuid) for index, (_, uuid) in enumerate(chosen)],
+        environment.get("HIP_VISIBLE_DEVICES", environment.get("CUDA_VISIBLE_DEVICES")),
+    )
+    address = {gpu.uuid: gpu.address for gpu in listed}
+    states = []
+    for _, uuid in chosen:
+        base = f"/sys/bus/pci/devices/{address[uuid]}/mem_info_vram_"
+        total, used = identity.read(host, base + "total"), identity.read(host, base + "used")
+        free = (
+            int(total) - int(used)
+            if total and used and total.isdigit() and used.isdigit()
+            else None
+        )
+        states.append(GPUState(uuid, free, busy[uuid], "ROCm"))
+    return tuple(states)
+
+
+def _nvidia(host: Host) -> Optional[tuple[GPUState, ...]]:
     if not host.which("nvidia-smi"):
         return ()
     listed = host.command(
@@ -493,19 +590,38 @@ def _available(host: Host, system: str) -> Optional[int]:
             value = room if value is None else min(value, room)
         return value
     if system == "darwin":
-        text = identity.output(host, ["vm_stat"]) or ""
-        page = re.search(r"page size of (\d+) bytes", text)
-        pages = dict(re.findall(r"^Pages (free|inactive|speculative):\s+(\d+)\.", text, re.M))
-        if not page or len(pages) != 3:
+        # As the engine's ledger measures it (ledger-native.cpp): what an allocation takes
+        # before the kernel compresses anything, by its own live thresholds. That is the
+        # free pages above the free target, the file-backed pages above the file cache
+        # minimum, and the purgeable and reusable pages.
+        names = (
+            "vm.pagesize",
+            "vm.page_free_count",
+            "vm.vm_page_free_target",
+            "vm.page_pageable_external_count",
+            "vm.vm_page_filecache_min",
+            "vm.page_purgeable_count",
+            "vm.page_reusable_count",
+        )
+        try:
+            page, free, target, file, minimum, purgeable, reusable = (
+                identity.sysctl_int(host, n) for n in names
+            )
+        except RuntimeError:
             return None
-        return sum(int(count) for count in pages.values()) * int(page.group(1))
+        return (max(0, free - target) + max(0, file - minimum) + purgeable + reusable) * page
+    if system == "windows":
+        try:
+            return host.windows().memory().available_bytes
+        except OSError:
+            return None
     return None
 
 
 def read_runtime(
     *, memory_budget_bytes: Optional[int] = None, host: Optional[Host] = None
 ) -> RuntimeFacts:
-    """Read this machine's runtime facts now (Linux and macOS)."""
+    """Read this machine's runtime facts now."""
     live: Host = host or NativeHost()
     system = live.platform()
     if system == "linux":
@@ -516,6 +632,10 @@ def read_runtime(
         # macOS has no affinity: every logical CPU is usable.
         cpus = cpu_list(f"0-{identity.sysctl_int(live, 'hw.logicalcpu') - 1}")
         gpus = ()
+    elif system == "windows":
+        # Group 0 logical processor indices, as the engine and its CPU masks number them.
+        cpus = live.windows().process_cpus()
+        gpus = _gpus(live)
     else:
         raise identity.UnsupportedPlatform(f"runtime facts are not read on {system} yet")
     return RuntimeFacts(tuple(cpus), gpus, _available(live, system), memory_budget_bytes)

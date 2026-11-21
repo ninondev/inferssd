@@ -1,11 +1,15 @@
 #pragma once
 
 #include "cpu-sink.h"
+#include "ggml-cpu.h"
+#include "ggml-ssd/store/expert-layout.h"
 #include <cmath>
+#include <cstdint>
+#include <functional>
 #include "ggml-ssd/telemetry/telemetry.h"
 
 // Matches mul(weight) followed by ggml_rms_norm, which squares in float and sums in double, then route scaling.
-inline void kimi_cpu_sink_normalize_expert(float * values, int rows, const float * norm, float eps) {
+inline void ssd_cpu_sink_normalize_expert(float * values, int rows, const float * norm, float eps) {
     double sum = 0.0;
     for (int row = 0; row < rows; ++row) {
         values[row] *= norm[row];
@@ -24,20 +28,33 @@ inline void kimi_cpu_sink_normalize_expert(float * values, int rows, const float
 // Streaming is a prefill operation: it disables decode cache (normally releases
 // it; optional cross-request retention checks the same memory guard) and
 // always uses ring targets. Cache admission requires a subsequent decode begin.
-using kimi_cpu_sink_parallel_fn = void (*)(void * userdata, int ith, int nth);
-using kimi_cpu_sink_consumer_fn = void (*)(void * userdata, size_t expert,
+// The CPU's kernels for one format of the sink's expert layout, chosen when the sink is created: each role's vec_dot
+// against a row of the role's input quantized to its vec_dot_type, the latent's for up and gate (one quantization of
+// the input serves both, so their vec_dot_types match) and the hidden's for down.
+struct ssd_cpu_expert_kernels {
+    ggml_vec_dot_t dot[SSD_EXPERT_ROLES];
+    ggml_type input_type, hidden_type;                // the vec_dot_types of up (and gate) and of down
+    ggml_from_float_t quantize_input, quantize_hidden;
+    size_t row_bytes[SSD_EXPERT_ROLES];               // a weight row of each role
+    size_t input_row_bytes, hidden_row_bytes;         // a quantized latent row, a quantized hidden row
+    bool mxfp4;                                       // every role is MXFP4
+};
+// The sink's expert layout, and the kernels of routed layer `layer`'s format (null for any other layer).
+const ssd_expert_layout & ssd_cpu_sink_layout(const struct ssd_cpu_sink * sink) noexcept;
+const ssd_cpu_expert_kernels * ssd_cpu_sink_kernels(const struct ssd_cpu_sink * sink, int32_t layer) noexcept;
+
+using ssd_cpu_sink_parallel_fn = void (*)(void * userdata, int ith, int nth);
+using ssd_cpu_sink_consumer_fn = void (*)(void * userdata, size_t expert,
         const void * up, const void * gate, const void * down);
 
-struct kimi_cpu_sink_prefill_batch {
-    const void * quantized_input;
-    size_t quantized_stride;
+struct ssd_cpu_sink_prefill_batch {
     const float * f32_input;
     size_t f32_stride;
     const int32_t * route_request_index;
     const float * weights;
     int nslots;
     int ntokens;
-    struct kimi_cpu_sink_activation activation;
+    struct ssd_cpu_sink_activation activation;
     float * output;
     uint64_t gpu_experts;
     uint64_t gpu_routes;
@@ -51,13 +68,8 @@ struct kimi_cpu_sink_prefill_batch {
     uint64_t gpu_ssd_transient_upload_bytes;
     double gpu_ssd_transient_upload_us;
     double gpu_worker_us;
-    double gpu_expert_us;    // MXFP4 batch path: the GPU worker's time in its expert computations
+    double gpu_expert_us;    // the GPU's time in its expert chains
     double gpu_read_wait_us; // the GPU worker's wait for streamed SSD reads
-    uint64_t gpu_cold_admit_candidates;
-    uint64_t gpu_cold_admit_experts;
-    uint64_t gpu_cold_admit_routes;
-    uint64_t gpu_cold_admit_upload_bytes;
-    double gpu_cold_admit_upload_us;
     uint64_t ram_experts;
     uint64_t ram_routes;
     uint64_t ram_bytes;
@@ -66,16 +78,18 @@ struct kimi_cpu_sink_prefill_batch {
     uint64_t ssd_bytes;
 };
 
-void kimi_cpu_sink_parallel(struct kimi_cpu_sink * sink,
-        kimi_cpu_sink_parallel_fn function, void * userdata);
-void kimi_cpu_sink_parallel_last(struct kimi_cpu_sink * sink,
-        kimi_cpu_sink_parallel_fn function, void * userdata);
-bool kimi_cpu_sink_stream_hybrid(struct kimi_cpu_sink * sink,
-        const struct ggml_tensor * up, const struct ggml_tensor * gate,
-        const struct ggml_tensor * down, const int32_t * ids, int nexperts,
-        struct kimi_cpu_sink_prefill_batch * batch,
-        kimi_cpu_sink_consumer_fn consumer, void * userdata,
-        struct kimi_cpu_sink_stats * stats, char * error, size_t error_size);
+void ssd_cpu_sink_parallel(struct ssd_cpu_sink * sink,
+        ssd_cpu_sink_parallel_fn function, void * userdata);
+// Runs grow, which allocates and first touches `bytes` of host memory outside the caches, under a ticket of the sink's
+// host-memory context: the ledger makes room for them (the RAM cache gives slots back) and refuses only what the
+// envelope cannot hold, as the sink's own scratch is priced. Throws the refusal; call outside a run.
+void ssd_cpu_sink_host_grow(struct ssd_cpu_sink * sink, uint64_t bytes, const std::function<void()> & grow);
+void ssd_cpu_sink_parallel_last(struct ssd_cpu_sink * sink,
+        ssd_cpu_sink_parallel_fn function, void * userdata);
+bool ssd_cpu_sink_stream_hybrid(struct ssd_cpu_sink * sink, int32_t layer, const int32_t * ids, int nexperts,
+        struct ssd_cpu_sink_prefill_batch * batch,
+        ssd_cpu_sink_consumer_fn consumer, void * userdata,
+        struct ssd_cpu_sink_stats * stats, char * error, size_t error_size);
 
 // Borrowed immutable selection; the prefill owner never outlives its sink.
-const ssd::telemetry::debug_channels & kimi_cpu_sink_debug(const kimi_cpu_sink * sink) noexcept;
+const ssd::telemetry::debug_channels & ssd_cpu_sink_debug(const ssd_cpu_sink * sink) noexcept;
